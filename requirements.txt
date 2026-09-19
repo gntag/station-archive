@@ -1,0 +1,21 @@
+# Station archive — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Targets Python >= 3.10 (the code uses PEP 604 built-in generics).
+
+# --- Core numerics / data ---
+numpy
+pandas
+
+# --- I/O backends pandas needs for the archive's formats ---
+pyarrow            # parquet: the consolidated gold table and fold manifest
+openpyxl           # xlsx: the merge-review workbook (observations/review.py)
+
+# --- Spatial fold blocking ---
+scikit-learn       # KMeans, in observations/fold_manifest.py
+
+# --- Optional: only needed to fetch the Copernicus C3S land source ---
+# cdsapi           # reads ~/.cdsapirc or CDSAPI_URL / CDSAPI_KEY
+
+# --- Tests ---
+pytest

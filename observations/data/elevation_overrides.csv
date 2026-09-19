@@ -1,0 +1,2 @@
+canonical_station_id,elevation_m,reason
+c3s_land:HRE00155411,165.0,"metadata_conflicts.csv: verified-identical series (dist=0km, tasmax r=1.0) disagreed 52m (ecad, selected by observation count) vs 165m (ghcnd/c3s_land). CERRA orography at (42.56, 18.27) reports 164.03m, confirming 165m. Recorded in E:/station_archive/review/station_merge_review.xlsx sheet Elevation_overrides."

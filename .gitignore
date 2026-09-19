@@ -1,0 +1,49 @@
+# --- Never commit the archive itself ---------------------------------------
+# Provider data carries redistribution restrictions (ECA&D public station
+# data is non-commercial research and education only). The archive lives
+# outside the repo by default via STATION_ARCHIVE_ROOT; these patterns are a
+# second line of defence in case anyone points it at a checkout.
+station_archive/
+archive/
+raw/
+consolidated/
+canonical/
+inventory/
+manifests/
+review/
+*.parquet
+*.nc
+*.zip
+
+# Derived tables and workbooks
+canonical_stations.csv
+station_aliases.csv
+station_metadata_history.csv
+duplicate_evidence.csv
+metadata_conflicts.csv
+observations_consolidated*.csv
+source_contribution.csv
+fallback_compatibility.csv
+qc_rejections.csv
+homogeneity_breakpoints.csv
+*.xlsx
+
+# --- Credentials -----------------------------------------------------------
+.cdsapirc
+.env
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
