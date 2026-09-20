@@ -67,8 +67,10 @@ def test_compatible_sources_pass():
 
 def test_biased_fallback_is_refused():
     """
-    GSOD runs 0.303 degC warm against GHCN-D because it summarises a UTC day.
-    A larger step than that must not be spliced in silently.
+    Sources disagree by station -- for tas with an ECA&D primary and a GSOD
+    fallback, measured overlap bias spans -1.60 to +0.58 degC. A step beyond
+    the configured tolerance must not be spliced in silently; the gap stays
+    open instead.
     """
     a = _daily(_seasonal(800, seed=1) / 10)
     b = _daily(_seasonal(800, offset=2.0, seed=1) / 10)
@@ -562,18 +564,19 @@ def test_gross_range_does_not_clip_genuine_extremes():
     assert list(out.values["value"]) == pytest.approx([-45.0, 48.0])
 
 
-def test_gsod_day_window_correction_is_applied_before_selection():
+def test_gsod_values_reach_selection_unadjusted():
     """
-    The measured 0.303 degC GSOD/tas day-window offset (plan: "GSOD
-    summarises a UTC day where GHCN-D and ECA&D use a local climatological
-    day") is subtracted before the value ever reaches selection or the
-    compatibility check.
+    The gold table carries provider values as issued, converted to canonical
+    units and nothing else. No day-window offset is applied to GSOD tas: the
+    one that used to be (0.303 degC) was withdrawn as unsupported -- see
+    standardize.GSOD_DAY_WINDOW_BIAS_CORRECTION. A disagreement between
+    sources is handled by refusing the splice, never by adjusting a value.
     """
     loader = FakeLoader({("gsod", "S", "tas"): _daily([68.0])})   # 68 degF = 20.0 degC
     out = consolidate_station_variable(
         "c:1", _aliases(("gsod", "S")), "tas", loader, priority=("gsod",)
     )
-    assert out.values["value"].iloc[0] == pytest.approx(20.0 - 0.303, abs=1e-6)
+    assert out.values["value"].iloc[0] == pytest.approx(20.0, abs=1e-6)
 
 
 def test_impossible_values_cannot_poison_a_compatibility_test():

@@ -140,45 +140,60 @@ def canonical_unit_for(variable: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # GSOD day-window bias correction
 # ---------------------------------------------------------------------------
-# NOAA GSOD aggregates its daily summary over the UTC calendar day; GHCN-D
-# and ECA&D aggregate over the station's local civil day (consolidate.py:
-# "GSOD summarises a UTC day where GHCN-D and ECA&D use a local climatological
-# day"). For an Eastern Mediterranean station (UTC+2/+3), that shifts GSOD's
-# aggregation window several hours relative to every other source in this
-# archive, producing a small, systematic bias that is not genuine climate
-# signal.
+# THIS TABLE IS DELIBERATELY EMPTY. No day-window correction is applied to
+# any source or variable, and none may be added without a measurement of the
+# exact (source pair, variable) it will be applied to.
 #
-# No sub-daily GSOD data exists in this archive to re-aggregate over the
-# correct window directly, so the correction here is the best available
-# proxy: an additive bias measured on confirmed-duplicate GSOD/GHCN-D station
-# pairs -- "GSOD runs 0.303 degC warmer than GHCN-D on the days they share"
-# (consolidate.py; the same measurement check_compatibility's bias test
-# catches and refuses to splice, rather than correcting).
+# An earlier version of this file subtracted 0.303 degC from GSOD 'tas'. That
+# was withdrawn as unsupported. The number itself is real -- it is the median
+# difference on confirmed-duplicate GHCN-D/GSOD pairs in this archive -- but
+# every step from there to "subtract it from GSOD tas" was wrong:
 #
-# Scoped to 'tas' only. A parallel check on tasmax fallback-candidate pairs
-# (fallback_compatibility.csv, 48 tested GSOD/tasmax candidates) gave a mean
-# bias of -0.13 degC with a near-zero median -- inconsistent in both
-# magnitude and sign with a uniform day-window offset. Applying 0.303 to
-# tasmax (or tasmin, untested) would be guessing a number the evidence does
-# not support; it stays at 0.0 until a dedicated remeasurement documents one.
-GSOD_DAY_WINDOW_BIAS_CORRECTION: dict[str, float] = {
-    "tas": 0.303,
-}
+#   * WRONG VARIABLE. Of the 20 GHCN-D/GSOD duplicate pairs carrying a bias,
+#     19 are match_variable 'tasmax' and one is 'pr'. duplicate_evidence.csv
+#     contains no 'tas' comparison at all. The constant is a tasmax
+#     statistic; it was applied to tas.
+#   * WRONG SOURCE PAIR. SOURCE_PRIORITY['tas'] is ('ecad', 'gsod') and
+#     GHCN-D contributes no tas values whatsoever, so the correction could
+#     only ever act where GSOD meets ECA&D -- a pair whose measured bias is
+#     0.0002 degC (config.py).
+#   * WRONG SIGN. Measured on this archive before the correction existed,
+#     tas with an ecad primary and a gsod fallback ran at a median -0.16 degC
+#     over 14 station pairs: GSOD is COLDER than ECA&D here, not warmer.
+#     Subtracting a further 0.303 pushed two Greek stations past the +/-0.5
+#     degC fallback guardrail and discarded 4,750 previously accepted days.
+#
+# A UTC-versus-local aggregation window is a real phenomenon, and it would be
+# expected to show up most in tasmax/tasmin -- where a shifted window can
+# capture a different diurnal extremum -- and least in tas, a daily mean.
+# The withdrawn correction was applied in exactly the opposite pattern.
+#
+# The archive therefore carries provider values as issued, converted to
+# canonical units and nothing more. check_compatibility already refuses to
+# splice a source whose overlap bias is too large, which is the honest
+# response to a suspected offset: leave the gap, do not manufacture the
+# value. Diagnose, never silently adjust (plan section 1.4).
+GSOD_DAY_WINDOW_BIAS_CORRECTION: dict[str, float] = {}
 
 
 def apply_day_window_correction(
     values: pd.Series, source: str, variable: str
 ) -> pd.Series:
     """
-    Subtract the measured day-window systematic bias for (source, variable),
-    if one has been documented in GSOD_DAY_WINDOW_BIAS_CORRECTION. A no-op
-    for every other source or variable -- silence here means "not measured",
-    never "measured as zero".
+    Subtract a measured day-window systematic bias for (source, variable),
+    if one has been documented in GSOD_DAY_WINDOW_BIAS_CORRECTION.
 
-    Applied in the silver layer, after to_canonical() and before any
-    fallback-compatibility comparison, so GSOD's own known offset cannot
-    itself trigger check_compatibility's bias guardrail nor get spliced into
-    a series carrying it uncorrected.
+    That table is empty, so this is currently a no-op for every input: the
+    archive carries provider values as issued. It is kept as the single,
+    named place such a correction would have to go, precisely so that adding
+    one is a visible, reviewable change to a table that states what was
+    measured, on which source pair, and for which variable -- rather than an
+    arithmetic adjustment buried in a parsing path.
+
+    Anything added here must be measured on the same (source pair, variable)
+    it will be applied to. A statistic borrowed from a different variable, or
+    from a source pair the variable never uses, is not evidence. See the
+    table's comment for the withdrawn correction that ignored both rules.
     """
     if source != "gsod":
         return values

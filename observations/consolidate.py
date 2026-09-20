@@ -36,12 +36,19 @@ bias, dispersion, wet-day frequency and discontinuities.  A failed
 compatibility test leaves a gap or creates a time-bounded station segment; it
 does not justify blind splicing."
 
-This is not hypothetical here.  Measured on confirmed duplicates in this
-archive, GSOD runs 0.303 degC warmer than GHCN-D on the days they share,
-because GSOD summarises a UTC day where GHCN-D and ECA&D use a local
-climatological day.  Splicing GSOD days into an ECA&D series without testing
-would inject a step change into a series later used to fit a downscaling
-model and to define a bias-adjustment reference distribution.
+This is not hypothetical here.  Sources disagree by station: for tas with an
+ECA&D primary and a GSOD fallback, the measured overlap bias runs from -1.60
+to +0.58 degC across 14 station pairs.  Splicing GSOD days into an ECA&D
+series without testing would inject a step change into a series later used to
+fit a downscaling model and to define a bias-adjustment reference
+distribution.
+
+Note the spread, and that it straddles zero.  It is why this module tests
+every switch at the station it is about to make it at, and why no
+archive-wide offset is applied to stand in for that test: see
+standardize.GSOD_DAY_WINDOW_BIAS_CORRECTION for a withdrawn correction that
+took one source pair's median for one variable and applied it to a different
+variable of a different pair.
 
 WHAT THIS MODULE MUST NEVER DO
 ------------------------------

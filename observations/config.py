@@ -314,15 +314,24 @@ SOURCE_PRIORITY: dict[str, tuple[str, ...]] = {
 # compatibility test leaves a gap or creates a time-bounded station segment;
 # it does not justify blind splicing."
 #
-# Measured on confirmed duplicates in this archive, as median values:
+# Measured on confirmed duplicates in this archive, as median values. These
+# come from duplicate_evidence.csv, whose comparisons are almost entirely
+# tasmax -- the variable identity matching happened to use -- so each figure
+# below is a TASMAX statistic and describes no other variable:
 #   ecad vs ghcnd   bias  0.0000 degC   (byte-identical records)
 #   ecad vs gsod    bias  0.0002 degC
-#   ghcnd vs gsod   bias  0.3030 degC   <- GSOD summarises a UTC day where the
-#                                          others use a local climatological
-#                                          day, so it runs systematically warm
+#   ghcnd vs gsod   bias  0.3030 degC
 #
-# The default admits the observed GHCN-D/GSOD offset rather than blocking it;
-# tighten FALLBACK_MAX_BIAS below 0.30 to refuse those splices instead.
+# Do not read the third line as "GSOD runs warm". It is one median over 19
+# tasmax pairs, it is not reproduced for other variables or other source
+# pairs, and GHCN-D supplies no tas at all, so it says nothing about the
+# ECA&D/GSOD tas fallbacks that make up most of this archive's switches --
+# those run at a median -0.16 degC, the opposite sign. A correction built on
+# that misreading was applied and withdrawn; see
+# standardize.GSOD_DAY_WINDOW_BIAS_CORRECTION.
+#
+# The default admits an offset of this size rather than blocking it; tighten
+# FALLBACK_MAX_BIAS below 0.30 to refuse those splices instead.
 FALLBACK_MIN_OVERLAP_DAYS = 180
 
 FALLBACK_MAX_BIAS = {
