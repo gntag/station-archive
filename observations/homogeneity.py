@@ -131,6 +131,41 @@ MIN_SNHT_STATISTIC = 20.0
 # Variables aggregated to a monthly TOTAL rather than a monthly mean.
 SUM_VARIABLES = frozenset({"pr"})
 
+# Variables tested on a MULTIPLICATIVE rather than an additive basis.
+#
+# SNHT assumes the difference series has constant variance: it compares
+# segment means in units of the series' own standard deviation, so a series
+# whose spread grows with its level violates the assumption directly.
+# Precipitation does exactly that -- the month-to-month spread of a 200 mm
+# winter month is nothing like that of a 10 mm one, so a target-minus-neighbor
+# difference in millimetres is heteroscedastic by construction, and the wet
+# months dominate the statistic whether or not anything shifted there.
+#
+# The established fix is to treat precipitation ratios rather than
+# differences (Climatol normalises precipitation-like variables by their
+# mean rather than by subtracting it). Taking logarithms first turns that
+# ratio into a difference again, so the whole additive machinery below --
+# deseasonalising, the neighbor difference series, SNHT itself -- applies
+# unchanged, while the variance is stabilised. The cost is that a detected
+# `shift` for these variables is in natural-log units: exp(shift) is the
+# multiplicative factor by which the station's totals changed. The
+# `transform` field on BreakpointResult records which basis was used so the
+# number is never read in the wrong units.
+LOG_VARIABLES = frozenset({"pr"})
+
+# Offset added before taking logarithms, in the variable's own units, so
+# that a genuinely dry month (0 mm) is representable at all.
+PRECIP_LOG_OFFSET_MM = 1.0
+
+# Calendar months whose climatological total is below this are dropped from
+# a log-basis series entirely. At a 2 mm climatology the log ratio is driven
+# by PRECIP_LOG_OFFSET_MM and by trace amounts rather than by the station,
+# so a single showery month would read as a large multiplicative anomaly --
+# the same heteroscedasticity problem the transform exists to remove, merely
+# moved to the dry end. Dry-season months in this domain are routinely of
+# that size, which is why the guard is needed rather than hypothetical.
+MIN_PRECIP_CLIMATOLOGY_MM = 5.0
+
 
 @dataclass(frozen=True)
 class BreakpointResult:
@@ -146,8 +181,14 @@ class BreakpointResult:
       series_too_short    -- too few months for a non-degenerate search
       no_variance         -- the difference series is constant
 
-    `shift` is in the variable's monthly units: degC (or %, m/s) for a
-    monthly mean, mm/month for precipitation's monthly total.
+    `transform` says how to read `shift`, and must be consulted before the
+    number is used:
+      difference -- `shift` is in the variable's own monthly units: degC
+                    (or %, m/s) for a monthly mean.
+      log_ratio  -- `shift` is in natural-log units, because the variable is
+                    tested multiplicatively (see LOG_VARIABLES).
+                    exp(shift) is the factor the station's monthly totals
+                    changed by; `shift_as_ratio` does that conversion.
     """
 
     canonical_station_id: str
@@ -162,6 +203,17 @@ class BreakpointResult:
     segment_after_mean: float
     shift: float
     status: str = "tested"
+    transform: str = "difference"
+
+    def shift_as_ratio(self) -> float:
+        """
+        `shift` expressed as a multiplicative factor, for log_ratio results.
+        1.0 means no change; 1.2 means 20% wetter after the breakpoint.
+        Returns NaN for additive results, where a ratio is not defined.
+        """
+        if self.transform != "log_ratio" or not np.isfinite(self.shift):
+            return float("nan")
+        return float(np.exp(self.shift))
 
     def to_dict(self) -> dict:
         return {
@@ -177,7 +229,18 @@ class BreakpointResult:
             "segment_after_mean": self.segment_after_mean,
             "shift": self.shift,
             "status": self.status,
+            "transform": self.transform,
+            "shift_ratio": self.shift_as_ratio(),
         }
+
+
+def transform_for(variable: str) -> str:
+    """
+    Which basis a variable is tested on: "log_ratio" for LOG_VARIABLES,
+    "difference" otherwise. Recorded on every result so `shift` is never
+    read in the wrong units.
+    """
+    return "log_ratio" if variable in LOG_VARIABLES else "difference"
 
 
 def to_monthly_anomalies(
@@ -194,6 +257,13 @@ def to_monthly_anomalies(
     month climatology is then subtracted, so what remains is the anomaly --
     the part of the signal a breakpoint can actually show up in, with the
     annual cycle (which every neighbor shares anyway) taken out.
+
+    For LOG_VARIABLES the same steps run in log space, which makes the
+    anomaly a log ratio to the calendar month's geometric mean rather than a
+    difference from its arithmetic mean -- see LOG_VARIABLES for why
+    precipitation must be tested multiplicatively. Calendar months too dry
+    for a ratio to mean anything (below MIN_PRECIP_CLIMATOLOGY_MM) are
+    dropped before the transform.
     """
     if series.empty:
         return pd.Series(dtype="float64")
@@ -206,6 +276,16 @@ def to_monthly_anomalies(
         return pd.Series(dtype="float64")
 
     monthly.index = monthly.index.to_timestamp()
+
+    if variable in LOG_VARIABLES:
+        # Drop near-dry calendar months on the RAW totals, before the
+        # transform, so the threshold keeps its physical meaning in mm.
+        wet_enough = monthly.groupby(monthly.index.month).transform("mean") >= MIN_PRECIP_CLIMATOLOGY_MM
+        monthly = monthly[wet_enough]
+        if monthly.empty:
+            return pd.Series(dtype="float64")
+        monthly = np.log(monthly.clip(lower=0.0) + PRECIP_LOG_OFFSET_MM)
+
     climatology = monthly.groupby(monthly.index.month).transform("mean")
     return (monthly - climatology).sort_index()
 
@@ -384,6 +464,7 @@ def detect_breakpoint(
       * at least min_neighbors neighbors contributed, since one neighbor
         cannot say whether the target or the neighbor moved.
     """
+    transform = transform_for(variable)
     monthly_target = to_monthly_anomalies(target, variable)
     monthly_neighbors = {
         name: to_monthly_anomalies(series, variable)
@@ -395,7 +476,7 @@ def detect_breakpoint(
         return BreakpointResult(
             canonical_station_id, variable, n_used, len(reference),
             None, float("nan"), float("nan"), False,
-            float("nan"), float("nan"), float("nan"), status,
+            float("nan"), float("nan"), float("nan"), status, transform,
         )
 
     if n_used == 0:
@@ -410,7 +491,7 @@ def detect_breakpoint(
     if std == 0:
         return BreakpointResult(
             canonical_station_id, variable, n_used, len(reference),
-            None, 0.0, 1.0, False, mean, mean, 0.0, "no_variance",
+            None, 0.0, 1.0, False, mean, mean, 0.0, "no_variance", transform,
         )
     standardized = (values - mean) / std
     n = len(standardized)
@@ -442,7 +523,130 @@ def detect_breakpoint(
         segment_after_mean=float(np.mean(after)),
         shift=float(np.mean(after) - np.mean(before)),
         status="tested",
+        transform=transform,
     )
+
+
+# Columns of the project flag layer (plan section 1.4: "retain provider QC
+# flags and layer project flags rather than overwriting them"). One row per
+# flagged canonical_station_id x variable.
+FLAG_LAYER_COLUMNS: tuple[str, ...] = (
+    "canonical_station_id",
+    "variable",
+    "flag",
+    "breakpoint_date",
+    "statistic",
+    "p_value",
+    "shift",
+    "shift_ratio",
+    "transform",
+    "n_neighbors_used",
+    "n_months_tested",
+    "detected_by",
+)
+
+# Columns apply_flag_layer adds to an observation table. Named distinctly
+# from anything a provider writes, so layering can never collide with a
+# retained provider QC flag.
+FLAG_COLUMNS: tuple[str, ...] = (
+    "homogeneity_flag",
+    "homogeneity_breakpoint_date",
+    "homogeneity_segment",
+)
+
+
+def build_flag_layer(
+    report: pd.DataFrame,
+    detected_by: str = "snht_relative_monthly",
+) -> pd.DataFrame:
+    """
+    Reduce a run_report result to the project flag layer: one row per
+    station/variable that survived the FDR correction, in a form that joins
+    onto the consolidated table.
+
+    Only FDR-surviving rows become flags. `significant` alone is the
+    uncorrected column kept for reference (see run_report); publishing it as
+    an archive-level flag would push the report's own multiple-testing
+    problem onto everything downstream.
+
+    `detected_by` names the method, so a later detector (an iterative
+    multi-break decomposition, or PHA-style network attribution) can add
+    rows to the same layer without its flags being mistaken for these.
+    """
+    if report.empty or "significant_fdr" not in report.columns:
+        return pd.DataFrame(columns=list(FLAG_LAYER_COLUMNS))
+
+    flagged = report[report["significant_fdr"].astype(bool)].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=list(FLAG_LAYER_COLUMNS))
+
+    flagged["flag"] = "breakpoint_suspected"
+    flagged["detected_by"] = detected_by
+    for column in ("transform", "shift_ratio"):
+        if column not in flagged.columns:
+            flagged[column] = "difference" if column == "transform" else float("nan")
+    return flagged[list(FLAG_LAYER_COLUMNS)].reset_index(drop=True)
+
+
+def apply_flag_layer(values: pd.DataFrame, layer: pd.DataFrame) -> pd.DataFrame:
+    """
+    Layer the breakpoint flags onto a long-format observation table, so the
+    diagnosis is queryable alongside every other QC flag rather than living
+    in a table someone has to know to join by hand.
+
+    Adds FLAG_COLUMNS and changes nothing else -- no value is altered, no
+    row is dropped, and no existing column is touched (plan section 1.4:
+    layer project flags rather than overwriting them; section 1.6: this
+    module diagnoses and never corrects):
+
+      homogeneity_flag            True where this station/variable has a
+                                  suspected breakpoint at all.
+      homogeneity_breakpoint_date the detected date, repeated on every row
+                                  of that station/variable.
+      homogeneity_segment         0 for observations before the breakpoint,
+                                  1 from the breakpoint onward, <NA> where
+                                  unflagged. This is what makes the flag
+                                  usable: section 4.6's reference-
+                                  sensitivity test needs to hold a segment
+                                  out, or compare the two, which needs each
+                                  observation to know which side it is on.
+
+    `values` needs canonical_station_id, date and variable; anything else it
+    carries is passed through untouched.
+    """
+    collisions = [c for c in FLAG_COLUMNS if c in values.columns]
+    if collisions:
+        raise ValueError(
+            f"refusing to overwrite existing column(s) {collisions}; "
+            "flags are layered, never overwritten"
+        )
+
+    out = values.copy()
+    if layer.empty:
+        out["homogeneity_flag"] = False
+        out["homogeneity_breakpoint_date"] = pd.NaT
+        out["homogeneity_segment"] = pd.array([pd.NA] * len(out), dtype="Int8")
+        return out
+
+    keyed = layer[["canonical_station_id", "variable", "breakpoint_date"]].copy()
+    keyed["breakpoint_date"] = pd.to_datetime(keyed["breakpoint_date"])
+    # One flag per station/variable: if a future detector ever emits several
+    # breaks for one series, the earliest defines the first segment boundary.
+    keyed = keyed.sort_values("breakpoint_date").drop_duplicates(
+        ["canonical_station_id", "variable"], keep="first"
+    )
+    keyed = keyed.rename(columns={"breakpoint_date": "homogeneity_breakpoint_date"})
+
+    out = out.merge(keyed, on=["canonical_station_id", "variable"], how="left")
+    out["homogeneity_flag"] = out["homogeneity_breakpoint_date"].notna()
+
+    dates = pd.to_datetime(out["date"])
+    after = dates >= out["homogeneity_breakpoint_date"]
+    segment = np.where(after, 1, 0)
+    out["homogeneity_segment"] = pd.array(
+        np.where(out["homogeneity_flag"], segment, None), dtype="Int8"
+    )
+    return out
 
 
 def benjamini_hochberg(p_values: np.ndarray, alpha: float = 0.05) -> np.ndarray:

@@ -413,8 +413,14 @@ def command_homogeneity(args: argparse.Namespace) -> int:
         n_permutations=args.permutations, alpha=args.alpha,
     )
 
-    out_path = consolidated_dir / "homogeneity_breakpoints.csv"
-    report.to_csv(out_path, index=False)
+    out_path = consolidated_dir / "homogeneity_flags.csv"
+    report_path = consolidated_dir / "homogeneity_breakpoints.csv"
+    report.to_csv(report_path, index=False)
+
+    # The full report is the diagnostic record; the flag layer is the part
+    # that joins onto the gold table (plan 1.4: "layer project flags").
+    layer = homogeneity_module.build_flag_layer(report)
+    layer.to_csv(out_path, index=False)
 
     print(f"[homogeneity] {len(report)} station/variable series reached")
     if not report.empty:
@@ -434,17 +440,25 @@ def command_homogeneity(args: argparse.Namespace) -> int:
             for variable, row in by_variable.iterrows():
                 print(f"    {variable}: {int(row['sum'])}/{int(row['size'])} "
                       f"({row['sum'] / max(row['size'], 1):.0%})")
-            # Shifts are in each variable's own monthly units (degC, mm/month,
-            # m/s), so they are ranked within a variable, never across them.
+            # Shifts are in each variable's own monthly units (degC, m/s), so
+            # they are ranked within a variable, never across them. Variables
+            # tested multiplicatively carry a log-unit shift, which is printed
+            # as the factor it represents rather than as a raw number whose
+            # units differ silently from the rest of the column.
             print("[homogeneity] largest FDR-surviving shift per variable:")
             for variable, group in flagged.groupby("variable"):
                 top = group.reindex(group["shift"].abs().sort_values(ascending=False).index).head(3)
                 for _, row in top.iterrows():
+                    if row.get("transform") == "log_ratio":
+                        magnitude = f"x{row['shift_ratio']:.2f}"
+                    else:
+                        magnitude = f"shift {row['shift']:+.2f}"
                     print(f"    {variable}: {row['canonical_station_id']} "
-                          f"shift {row['shift']:+.2f} at {row['breakpoint_date']} "
+                          f"{magnitude} at {row['breakpoint_date']} "
                           f"(SNHT={row['statistic']:.0f}, n_neighbors={row['n_neighbors_used']})")
     print("")
-    print(f"[homogeneity] wrote -> {out_path}")
+    print(f"[homogeneity] report     -> {report_path}")
+    print(f"[homogeneity] flag layer -> {out_path} ({len(layer)} flags)")
     print("[homogeneity] diagnostic only -- no value in the archive was changed")
     return 0
 

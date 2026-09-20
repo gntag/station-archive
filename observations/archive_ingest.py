@@ -28,6 +28,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from observations import homogeneity
+
 # archive variable name -> wide output column name
 _VARIABLE_TO_COLUMN = {
     "tas":     "tmean_c",
@@ -131,6 +133,68 @@ def load_consolidated_archive(
 
     ordered = ["station_id", "date", "lat", "lon", "elevation_m", "name"] + list(_VARIABLE_TO_COLUMN.values())
     return result[ordered].sort_values(["station_id", "date"]).reset_index(drop=True)
+
+
+def load_homogeneity_flags(archive_dir: Path) -> pd.DataFrame:
+    """
+    Load the breakpoint flag layer written by `observations.cli homogeneity`
+    (consolidated/homogeneity_flags.csv), one row per flagged
+    canonical_station_id x variable.
+
+    Returns an empty frame with the right columns when the archive carries
+    no layer, so callers need no special case for an archive built before
+    the diagnosis was run.
+    """
+    path = Path(archive_dir) / "consolidated" / "homogeneity_flags.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=list(homogeneity.FLAG_LAYER_COLUMNS))
+    flags = pd.read_csv(path)
+    flags["breakpoint_date"] = pd.to_datetime(flags["breakpoint_date"])
+    return flags
+
+
+def attach_homogeneity_flags(
+    observations: pd.DataFrame,
+    flags: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add per-variable breakpoint flags to the wide station-day table.
+
+    For every value column present, adds:
+      <column>_inhomogeneous  True where that station/variable has a
+                              suspected breakpoint at all;
+      <column>_segment        0 before the breakpoint, 1 from it onward,
+                              <NA> where unflagged.
+
+    `homogeneity.apply_flag_layer` does the same job for the archive's own
+    long format; this is the wide-table equivalent, for consumers reading
+    station-days with one column per variable.
+
+    No observation is altered or dropped. These are flags to filter or
+    stratify on, and what to do about a flagged segment stays the caller's
+    decision -- the archive diagnoses inhomogeneity and never corrects it.
+    """
+    out = observations.copy()
+    dates = pd.to_datetime(out["date"])
+
+    for variable, column in _VARIABLE_TO_COLUMN.items():
+        if column not in out.columns:
+            continue
+        subset = flags[flags["variable"] == variable] if len(flags) else flags
+        breakpoints = (
+            dict(zip(subset["canonical_station_id"], pd.to_datetime(subset["breakpoint_date"])))
+            if len(subset) else {}
+        )
+        # Columns are added for every value column, flagged or not, so a
+        # consumer can read them unconditionally rather than probing for
+        # which variables happened to produce a flag this run.
+        mapped = out["station_id"].map(breakpoints) if breakpoints else pd.Series(pd.NaT, index=out.index)
+        flagged = mapped.notna()
+        out[f"{column}_inhomogeneous"] = flagged.to_numpy()
+        out[f"{column}_segment"] = pd.array(
+            np.where(flagged, (dates >= mapped).astype("int8"), None), dtype="Int8"
+        )
+    return out
 
 
 def find_pinnable_duplicate_pairs(

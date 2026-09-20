@@ -4,10 +4,13 @@ import pytest
 
 from observations.archive_ingest import (
     apply_elevation_overrides,
+    attach_homogeneity_flags,
     find_pinnable_duplicate_pairs,
     load_canonical_stations,
     load_consolidated_archive,
+    load_homogeneity_flags,
 )
+from observations.homogeneity import FLAG_LAYER_COLUMNS
 
 
 def _write_partitioned_observations(root, rows):
@@ -135,3 +138,85 @@ def test_find_pinnable_duplicate_pairs_resolves_aliases_and_excludes_never_merge
     assert ("canon_A", "canon_B") in resolved
     assert not any({"canon_C", "canon_D"} <= {x, y} for x, y in resolved)  # never-merge excluded
     assert not any({"canon_E"} <= {x, y} for x, y in resolved)  # already same canonical id
+
+
+# ---------------------------------------------------------------------------
+# homogeneity flag layer
+# ---------------------------------------------------------------------------
+
+def _wide_observations():
+    """The wide station-day schema load_consolidated_archive returns."""
+    dates = pd.to_datetime(["1994-06-01", "1996-01-01", "1998-03-01"])
+    return pd.DataFrame({
+        "station_id": ["st1"] * 3 + ["st2"] * 3,
+        "date": list(dates) * 2,
+        "lat": [38.0] * 6, "lon": [24.0] * 6,
+        "elevation_m": [10.0] * 6, "name": ["A"] * 3 + ["B"] * 3,
+        "tmean_c": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+        "prcp_mm": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    })
+
+
+def _flag_layer(rows):
+    frame = pd.DataFrame(rows)
+    for column in FLAG_LAYER_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = np.nan
+    return frame[list(FLAG_LAYER_COLUMNS)]
+
+
+def test_load_homogeneity_flags_missing_file_returns_typed_empty_frame(tmp_path):
+    """An archive built before the diagnosis existed must still load."""
+    flags = load_homogeneity_flags(tmp_path)
+    assert flags.empty
+    assert list(flags.columns) == list(FLAG_LAYER_COLUMNS)
+
+
+def test_load_homogeneity_flags_reads_and_parses_dates(tmp_path):
+    (tmp_path / "consolidated").mkdir(parents=True)
+    _flag_layer([
+        {"canonical_station_id": "st1", "variable": "tas", "flag": "breakpoint_suspected",
+         "breakpoint_date": "1996-01-01"},
+    ]).to_csv(tmp_path / "consolidated" / "homogeneity_flags.csv", index=False)
+
+    flags = load_homogeneity_flags(tmp_path)
+    assert len(flags) == 1
+    assert flags.iloc[0]["breakpoint_date"] == pd.Timestamp("1996-01-01")
+
+
+def test_attach_homogeneity_flags_marks_the_right_column_and_segment():
+    flags = _flag_layer([
+        {"canonical_station_id": "st1", "variable": "tas", "flag": "breakpoint_suspected",
+         "breakpoint_date": pd.Timestamp("1996-01-01")},
+    ])
+    out = attach_homogeneity_flags(_wide_observations(), flags)
+
+    st1 = out[out["station_id"] == "st1"]
+    assert st1["tmean_c_inhomogeneous"].all()
+    assert list(st1["tmean_c_segment"]) == [0, 1, 1]
+    # a tas break says nothing about precipitation at the same station
+    assert not st1["prcp_mm_inhomogeneous"].any()
+    assert st1["prcp_mm_segment"].isna().all()
+
+    st2 = out[out["station_id"] == "st2"]
+    assert not st2["tmean_c_inhomogeneous"].any()
+    assert st2["tmean_c_segment"].isna().all()
+
+
+def test_attach_homogeneity_flags_adds_columns_even_with_no_flags():
+    out = attach_homogeneity_flags(_wide_observations(), _flag_layer([]))
+    for column in ("tmean_c_inhomogeneous", "tmean_c_segment",
+                   "prcp_mm_inhomogeneous", "prcp_mm_segment"):
+        assert column in out.columns
+    assert not out["tmean_c_inhomogeneous"].any()
+
+
+def test_attach_homogeneity_flags_leaves_observations_untouched():
+    values = _wide_observations()
+    flags = _flag_layer([
+        {"canonical_station_id": "st1", "variable": "tas", "flag": "breakpoint_suspected",
+         "breakpoint_date": pd.Timestamp("1996-01-01")},
+    ])
+    out = attach_homogeneity_flags(values, flags)
+    assert len(out) == len(values)
+    pd.testing.assert_frame_equal(out[values.columns], values)

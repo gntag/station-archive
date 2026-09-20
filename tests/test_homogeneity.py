@@ -14,19 +14,25 @@ import pandas as pd
 import pytest
 
 from observations.homogeneity import (
+    FLAG_COLUMNS,
+    FLAG_LAYER_COLUMNS,
     MIN_DAYS_PER_MONTH,
     MIN_NEIGHBORS,
     MIN_NEIGHBOR_OVERLAP_MONTHS,
     MIN_SEGMENT_MONTHS,
     MIN_SNHT_STATISTIC,
+    PRECIP_LOG_OFFSET_MM,
     _restricted_max,
+    apply_flag_layer,
     benjamini_hochberg,
+    build_flag_layer,
     build_reference_difference,
     detect_breakpoint,
     run_report,
     select_neighbors,
     snht_statistic,
     to_monthly_anomalies,
+    transform_for,
     variable_series_by_station,
 )
 
@@ -54,6 +60,37 @@ def _correlated_series(n=_DEFAULT_DAYS, seed=0, shift_after=None, shift_amount=0
     if shift_after is not None:
         values = values.copy()
         values[shift_after:] += shift_amount
+    return pd.Series(values, index=idx)
+
+
+def _precip_series(n=_DEFAULT_DAYS, seed=0, start="1990-01-01",
+                    scale_after=None, factor=1.0, weather_seed=555):
+    """
+    A realistic daily precipitation series: a seasonal wet/dry cycle, a
+    REGIONAL monthly wetness factor shared by every station (same
+    weather_seed), and skewed day-to-day variation.
+
+    Regional wetness is multiplicative, not additive, which is how rainfall
+    actually varies between a wet winter and a dry one -- and why neighbors
+    correlate on the LOG scale rather than in millimetres.
+
+    `factor` scales every value from `scale_after` onward, the precipitation
+    analogue of an instrument change: a gauge that under-catches by 30%
+    shifts the record by a ratio, not by a fixed number of millimetres.
+    """
+    idx = pd.date_range(start, periods=n, freq="D")
+    seasonal = 3.0 + 2.5 * np.cos(2 * np.pi * idx.dayofyear.to_numpy() / 365.25)
+    months = idx.to_period("M")
+    unique_months = months.unique()
+    regional = pd.Series(
+        np.exp(np.random.default_rng(weather_seed).normal(0, 0.4, len(unique_months))),
+        index=unique_months,
+    )
+    local = np.random.default_rng(seed).gamma(shape=2.0, scale=0.5, size=n)
+    values = seasonal * regional.reindex(months).to_numpy() * local
+    if scale_after is not None:
+        values = values.copy()
+        values[scale_after:] *= factor
     return pd.Series(values, index=idx)
 
 
@@ -98,10 +135,73 @@ def test_to_monthly_anomalies_sums_precipitation():
     two_years = pd.concat([series, pd.Series(np.full(31, 4.0), index=idx2)])
     as_sum = to_monthly_anomalies(two_years, "pr")
     as_mean = to_monthly_anomalies(two_years, "tas")
-    # sums are 62 and 124 (anomalies -31/+31); means are 2 and 4 (-1/+1)
-    assert as_sum.to_numpy() == pytest.approx([-31.0, 31.0])
+    # Precipitation totals 62 and 124 mm, but pr is tested multiplicatively,
+    # so the anomaly is the log ratio to the calendar month's geometric mean
+    # rather than the mm difference: +/- half of log(125/63) after the
+    # PRECIP_LOG_OFFSET_MM offset. Temperature stays additive: means 2 and 4.
+    half_log_ratio = 0.5 * np.log(
+        (124 + PRECIP_LOG_OFFSET_MM) / (62 + PRECIP_LOG_OFFSET_MM)
+    )
+    assert as_sum.to_numpy() == pytest.approx([-half_log_ratio, half_log_ratio])
     assert as_mean.to_numpy() == pytest.approx([-1.0, 1.0])
     assert len(mean_based) == 1
+
+
+def test_to_monthly_anomalies_precipitation_anomaly_is_scale_free():
+    """
+    The reason pr is tested on a log basis: the same PROPORTIONAL change
+    must register the same whether it happens in a wet month or a dry one.
+    On a difference basis a 50% change in a 200 mm month dwarfs a 50%
+    change in a 20 mm one, which is precisely the non-constant variance
+    SNHT assumes away.
+    """
+    wet = pd.concat([
+        pd.Series(np.full(31, 6.0), index=pd.date_range("1990-01-01", periods=31, freq="D")),
+        pd.Series(np.full(31, 9.0), index=pd.date_range("1991-01-01", periods=31, freq="D")),
+    ])
+    dry = pd.concat([
+        pd.Series(np.full(30, 0.6), index=pd.date_range("1990-04-01", periods=30, freq="D")),
+        pd.Series(np.full(30, 0.9), index=pd.date_range("1991-04-01", periods=30, freq="D")),
+    ])
+    wet_anomaly = to_monthly_anomalies(wet, "pr").abs().max()
+    dry_anomaly = to_monthly_anomalies(dry, "pr").abs().max()
+
+    # Both months change by the same factor (x1.5), so the log anomalies are
+    # of the same order -- within a factor of two of each other, despite the
+    # raw totals differing by 10x. In millimetres they would differ ~10x.
+    assert dry_anomaly > 0
+    assert 0.5 < wet_anomaly / dry_anomaly < 2.0
+
+
+def test_to_monthly_anomalies_drops_near_dry_calendar_months():
+    """
+    A calendar month whose climatology is a millimetre or two carries no
+    usable ratio -- one showery month would read as a huge multiplicative
+    anomaly. Those months are dropped before the transform.
+    """
+    wet_july = pd.Series(
+        np.full(31, 5.0), index=pd.date_range("1990-07-01", periods=31, freq="D")
+    )
+    bone_dry_august = pd.Series(
+        np.full(31, 0.01), index=pd.date_range("1990-08-01", periods=31, freq="D")
+    )
+    result = to_monthly_anomalies(pd.concat([wet_july, bone_dry_august]), "pr")
+    assert list(result.index.month) == [7]
+
+
+def test_to_monthly_anomalies_handles_a_completely_dry_month_without_error():
+    """log(0) must not appear: PRECIP_LOG_OFFSET_MM makes 0 mm representable."""
+    wet = pd.Series(np.full(31, 5.0), index=pd.date_range("1990-01-01", periods=31, freq="D"))
+    zero = pd.Series(np.zeros(31), index=pd.date_range("1991-01-01", periods=31, freq="D"))
+    result = to_monthly_anomalies(pd.concat([wet, zero]), "pr")
+    assert len(result) == 2
+    assert np.isfinite(result.to_numpy()).all()
+
+
+def test_transform_for_marks_only_precipitation_multiplicative():
+    assert transform_for("pr") == "log_ratio"
+    assert transform_for("tas") == "difference"
+    assert transform_for("sfcWind") == "difference"
 
 
 def test_to_monthly_anomalies_removes_the_seasonal_cycle():
@@ -335,6 +435,47 @@ def test_detect_breakpoint_reports_series_too_short():
     assert not result.significant
 
 
+def test_detect_breakpoint_finds_a_multiplicative_precipitation_shift():
+    """
+    End to end on the log basis: a gauge that starts catching 50% more is a
+    RATIO change, and must be recovered as one.
+    """
+    bp_idx = 2200
+    target = _precip_series(seed=1, scale_after=bp_idx, factor=1.5)
+    neighbors = {f"n{i}": _precip_series(seed=100 + i) for i in range(3)}
+
+    result = detect_breakpoint("target", "pr", target, neighbors, n_permutations=200, seed=0)
+
+    assert result.status == "tested"
+    assert result.transform == "log_ratio"
+    assert result.significant
+    true_date = target.index[bp_idx]
+    assert abs((result.breakpoint_date - true_date).days) < 45
+    # `shift` is in log units; the factor it represents is what was injected.
+    assert result.shift_as_ratio() == pytest.approx(1.5, abs=0.25)
+
+
+def test_detect_breakpoint_precipitation_without_a_shift_is_not_significant():
+    target = _precip_series(seed=1)
+    neighbors = {f"n{i}": _precip_series(seed=100 + i) for i in range(3)}
+    result = detect_breakpoint("target", "pr", target, neighbors, n_permutations=200, seed=0)
+    assert not result.significant
+
+
+def test_detect_breakpoint_records_the_transform_on_every_status():
+    """`shift` cannot be read without knowing its basis, so the basis is
+    recorded even on results where no test ran."""
+    short = _precip_series(n=600, seed=1)
+    null_result = detect_breakpoint("target", "pr", short, {}, n_permutations=10)
+    assert null_result.status != "tested"
+    assert null_result.transform == "log_ratio"
+    assert np.isnan(null_result.shift_as_ratio())
+
+    additive = detect_breakpoint("target", "tas", _correlated_series(n=600), {}, n_permutations=10)
+    assert additive.transform == "difference"
+    assert np.isnan(additive.shift_as_ratio())   # a ratio is undefined here
+
+
 def test_detect_breakpoint_never_mutates_input_series():
     target = _correlated_series(seed=1)
     neighbors = {f"n{i}": _correlated_series(seed=10 + i) for i in range(2)}
@@ -434,6 +575,142 @@ def test_run_report_returns_empty_frame_for_no_data():
     stations_meta = pd.DataFrame(columns=["canonical_station_id", "lat", "lon"])
     values = pd.DataFrame(columns=["canonical_station_id", "date", "variable", "value"])
     assert run_report(values, stations_meta, ["tas"]).empty
+
+
+# ---------------------------------------------------------------------------
+# build_flag_layer / apply_flag_layer
+# ---------------------------------------------------------------------------
+
+def _report_row(station, variable="tas", significant_fdr=True, significant=True,
+                 breakpoint_date="1996-01-01"):
+    return {
+        "canonical_station_id": station,
+        "variable": variable,
+        "n_neighbors_used": 3,
+        "n_months_tested": 120,
+        "breakpoint_date": pd.Timestamp(breakpoint_date),
+        "statistic": 55.0,
+        "p_value": 0.002,
+        "significant": significant,
+        "segment_before_mean": -1.0,
+        "segment_after_mean": 1.0,
+        "shift": 2.0,
+        "status": "tested",
+        "transform": transform_for(variable),
+        "shift_ratio": float("nan"),
+        "significant_fdr": significant_fdr,
+    }
+
+
+def test_build_flag_layer_keeps_only_fdr_surviving_rows():
+    report = pd.DataFrame([
+        _report_row("a", significant_fdr=True),
+        _report_row("b", significant_fdr=False, significant=True),
+        _report_row("c", significant_fdr=False, significant=False),
+    ])
+    layer = build_flag_layer(report)
+    assert list(layer["canonical_station_id"]) == ["a"]
+    assert list(layer.columns) == list(FLAG_LAYER_COLUMNS)
+    assert layer["flag"].unique().tolist() == ["breakpoint_suspected"]
+    assert layer["detected_by"].nunique() == 1
+
+
+def test_build_flag_layer_empty_report_returns_typed_empty_frame():
+    empty = build_flag_layer(pd.DataFrame())
+    assert empty.empty
+    assert list(empty.columns) == list(FLAG_LAYER_COLUMNS)
+
+
+def test_build_flag_layer_no_survivors_returns_typed_empty_frame():
+    report = pd.DataFrame([_report_row("a", significant_fdr=False)])
+    layer = build_flag_layer(report)
+    assert layer.empty
+    assert list(layer.columns) == list(FLAG_LAYER_COLUMNS)
+
+
+def _values_frame():
+    dates = pd.to_datetime(["1994-06-01", "1996-01-01", "1998-03-01"])
+    return pd.DataFrame({
+        "canonical_station_id": ["a"] * 3 + ["b"] * 3,
+        "date": list(dates) * 2,
+        "variable": ["tas"] * 6,
+        "value": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    })
+
+
+def test_apply_flag_layer_marks_segments_either_side_of_the_break():
+    layer = build_flag_layer(pd.DataFrame([_report_row("a", breakpoint_date="1996-01-01")]))
+    flagged = apply_flag_layer(_values_frame(), layer)
+
+    station_a = flagged[flagged["canonical_station_id"] == "a"]
+    # the breakpoint date itself belongs to the segment AFTER the break
+    assert list(station_a["homogeneity_segment"]) == [0, 1, 1]
+    assert station_a["homogeneity_flag"].all()
+
+    station_b = flagged[flagged["canonical_station_id"] == "b"]
+    assert not station_b["homogeneity_flag"].any()
+    assert station_b["homogeneity_segment"].isna().all()
+
+
+def test_apply_flag_layer_never_alters_observations():
+    """The archive diagnoses and never corrects: values, rows and existing
+    columns must come through untouched."""
+    values = _values_frame()
+    layer = build_flag_layer(pd.DataFrame([_report_row("a")]))
+    flagged = apply_flag_layer(values, layer)
+
+    assert len(flagged) == len(values)
+    pd.testing.assert_frame_equal(flagged[values.columns], values)
+
+
+def test_apply_flag_layer_refuses_to_overwrite_an_existing_flag_column():
+    """Plan 1.4: layer project flags rather than overwriting them."""
+    values = _values_frame()
+    values["homogeneity_flag"] = False
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        apply_flag_layer(values, build_flag_layer(pd.DataFrame([_report_row("a")])))
+
+
+def test_apply_flag_layer_with_an_empty_layer_still_adds_the_columns():
+    """A consumer reads the flag columns unconditionally, so an archive with
+    no flags must still carry them."""
+    flagged = apply_flag_layer(_values_frame(), build_flag_layer(pd.DataFrame()))
+    for column in FLAG_COLUMNS:
+        assert column in flagged.columns
+    assert not flagged["homogeneity_flag"].any()
+    assert flagged["homogeneity_segment"].isna().all()
+
+
+def test_apply_flag_layer_is_variable_specific():
+    """A break in tas says nothing about pr at the same station."""
+    values = _values_frame()
+    values = pd.concat([values, values.assign(variable="pr")], ignore_index=True)
+    layer = build_flag_layer(pd.DataFrame([_report_row("a", variable="tas")]))
+    flagged = apply_flag_layer(values, layer)
+
+    assert flagged[(flagged["canonical_station_id"] == "a")
+                   & (flagged["variable"] == "tas")]["homogeneity_flag"].all()
+    assert not flagged[(flagged["canonical_station_id"] == "a")
+                       & (flagged["variable"] == "pr")]["homogeneity_flag"].any()
+
+
+def test_run_report_output_flows_into_the_flag_layer():
+    """The two halves must actually fit together on real report output."""
+    values = _archive_frame({
+        "a": _correlated_series(seed=1, shift_after=2200, shift_amount=4.0),
+        "b": _correlated_series(seed=2),
+        "c": _correlated_series(seed=3),
+    })
+    stations_meta = pd.DataFrame({
+        "canonical_station_id": ["a", "b", "c"],
+        "lat": [38.0, 38.05, 38.1], "lon": [24.0, 24.05, 24.1],
+    })
+    report = run_report(values, stations_meta, ["tas"], n_permutations=50, seed=0)
+    layer = build_flag_layer(report)
+
+    assert len(layer) == int(report["significant_fdr"].sum())
+    flagged = apply_flag_layer(values, layer)
+    assert set(FLAG_COLUMNS) <= set(flagged.columns)
 
 
 # ---------------------------------------------------------------------------
