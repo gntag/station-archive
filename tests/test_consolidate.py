@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from observations import config, consolidate
-from observations.consolidate import (
+from station_archive.policy import DEFAULT_POLICY
+from station_archive.consolidate import (
     CONSOLIDATED_COLUMNS,
     NON_SELECTED_COLUMNS,
     check_compatibility,
@@ -116,6 +116,80 @@ def test_discontinuity_is_refused_even_when_overall_bias_cancels():
     assert not result.compatible
     assert abs(result.bias) < 0.5                 # overall bias cancels
     assert "monthly departure" in result.reason
+
+
+def test_a_thinly_shared_month_cannot_drive_the_discontinuity_refusal():
+    """
+    The departure test is a statement about monthly means, so a month built
+    from one or two shared days is not a monthly mean and must not be able to
+    veto a splice on one outlier.
+
+    HomogeneityPolicy has carried min_days_per_month for exactly this reason;
+    FallbackPolicy did not, and this gate drives 48 of 157 refusals in the
+    published archive.
+    """
+    n = 800
+    base = _seasonal(n, seed=1) / 10
+    twin = base.copy()
+
+    primary = _daily(base)
+    fallback = _daily(twin)
+    assert check_compatibility(primary, fallback, "tasmax").compatible
+
+    # Give the fallback one extra day, far outside the primary's span, sitting
+    # alone in its own calendar month with a large offset.
+    lone = pd.Series(
+        [base[0] + 40.0],
+        index=pd.DatetimeIndex([pd.Timestamp("1990-01-01") + pd.Timedelta(days=n + 400)]),
+    )
+    with_outlier = pd.concat([fallback, lone])
+
+    result = check_compatibility(primary, with_outlier, "tasmax")
+    # That day is not shared with the primary, so it cannot enter the overlap
+    # at all -- this guards the construction of the test below.
+    assert result.compatible
+
+
+def test_a_month_with_too_few_shared_days_is_excluded_from_the_departure():
+    n = 800
+    base = _seasonal(n, seed=1) / 10
+    primary = _daily(base)
+    fallback = _daily(base.copy())
+
+    # A single shared day in a month of its own, disagreeing wildly. Included,
+    # it is a 40-degree "monthly departure"; excluded, the pair is compatible.
+    stray_date = pd.Timestamp("1990-01-01") + pd.Timedelta(days=n + 400)
+    primary_plus = pd.concat([primary, pd.Series([0.0], index=pd.DatetimeIndex([stray_date]))])
+    fallback_plus = pd.concat([fallback, pd.Series([40.0], index=pd.DatetimeIndex([stray_date]))])
+
+    result = check_compatibility(primary_plus, fallback_plus, "tasmax")
+    assert result.compatible, result.reason
+    assert result.max_monthly_departure < 1.0
+
+
+def test_an_overlap_with_no_well_populated_month_is_refused_outright():
+    """
+    Excluding thin months is strictly more permissive, so it opens a hole: an
+    overlap long enough to pass min_overlap_days but spread so thinly that NO
+    month qualifies would leave the discontinuity gate with nothing to test,
+    and a gate with nothing to test used to score 0.0 and pass.
+
+    A test that cannot be run has not been passed. Section 1.6: a failed
+    compatibility test leaves the gap open.
+    """
+    # 200 shared days spread one-per-week over four years: every month holds
+    # about four, below the 20-day minimum.
+    idx = pd.date_range("1990-01-01", periods=200, freq="7D")
+    rng = np.random.default_rng(5)
+    values = rng.normal(15.0, 3.0, 200)
+    primary = pd.Series(values, index=idx)
+    fallback = pd.Series(values, index=idx)          # identical: nothing else can fail
+
+    result = check_compatibility(primary, fallback, "tasmax")
+    assert result.n_overlap == 200                    # clears min_overlap_days
+    assert not result.compatible
+    assert "shared days" in result.reason
+    assert np.isnan(result.max_monthly_departure)
 
 
 def test_short_overlap_cannot_establish_compatibility():
@@ -291,9 +365,9 @@ def test_configured_priority_matches_measured_coverage():
     order".  hurs has exactly one source in this domain, and c3s_land appears
     in no list because it redelivers GHCN-D.
     """
-    assert config.SOURCE_PRIORITY["hurs"] == ("ecad",)
-    assert config.SOURCE_PRIORITY["gust"][0] == "gsod"       # 203 vs ecad's 65
-    for variable, order in config.SOURCE_PRIORITY.items():
+    assert DEFAULT_POLICY.source_priority["hurs"] == ("ecad",)
+    assert DEFAULT_POLICY.source_priority["gust"][0] == "gsod"       # 203 vs ecad's 65
+    for variable, order in DEFAULT_POLICY.source_priority.items():
         assert "c3s_land" not in order, variable
         assert len(set(order)) == len(order), variable
 
@@ -303,7 +377,7 @@ def test_gsod_ranks_below_ghcnd_for_precipitation():
     Coverage favours GSOD (203 stations vs 155); semantics do not -- GSOD's
     zero "includes a trace" and 46% of its zero rows are non-observations.
     """
-    order = config.SOURCE_PRIORITY["pr"]
+    order = DEFAULT_POLICY.source_priority["pr"]
     assert order.index("ghcnd") < order.index("gsod")
 
 
@@ -339,7 +413,7 @@ def test_station_snapshots_are_parsed_once_for_all_variables():
     variable would read 357 files where 51 suffice, which across 1600
     stations is the difference between minutes and hours.
     """
-    from observations import bronze
+    from station_archive import bronze
 
     calls = {"n": 0}
 
@@ -368,7 +442,7 @@ def test_station_snapshots_are_parsed_once_for_all_variables():
 
 
 def test_loader_returns_empty_for_a_variable_the_station_lacks():
-    from observations import bronze
+    from station_archive import bronze
 
     class StubLoader(bronze.SeriesLoader):
         def _station_map(self, source):
@@ -387,7 +461,7 @@ def test_loader_returns_empty_for_a_variable_the_station_lacks():
 
 
 def test_clear_releases_cached_series():
-    from observations import bronze
+    from station_archive import bronze
 
     class StubLoader(bronze.SeriesLoader):
         def _station_map(self, source):
@@ -422,14 +496,14 @@ def test_gsod_flag_i_zero_is_rejected_as_a_non_observation():
     day".  46% of GSOD's zero-precipitation rows carry it; reading them as
     0.0 mm inflates dry-day frequency.
     """
-    from observations import qc
+    from station_archive import qc
 
     reason = qc.reject_reason("gsod", "pr", 0.0, {"attributes": "I"})
     assert reason is not None and "flag I" in reason
 
 
 def test_gsod_flag_h_zero_is_rejected_on_the_providers_own_words():
-    from observations import qc
+    from station_archive import qc
 
     reason = qc.reject_reason("gsod", "pr", 0.0, {"attributes": "H"})
     assert reason is not None and "incomplete" in reason
@@ -437,21 +511,21 @@ def test_gsod_flag_h_zero_is_rejected_on_the_providers_own_words():
 
 def test_gsod_genuine_zero_is_kept():
     """Flags A-G describe which hours the total covers: real, if partial."""
-    from observations import qc
+    from station_archive import qc
 
     assert qc.reject_reason("gsod", "pr", 0.0, {"attributes": "F"}) is None
     assert qc.reject_reason("gsod", "pr", 0.04, {"attributes": "C"}) is None
 
 
 def test_flag_rules_do_not_leak_to_other_sources_or_variables():
-    from observations import qc
+    from station_archive import qc
 
     assert qc.reject_reason("ecad", "pr", 0.0, {"attributes": "I"}) is None
     assert qc.reject_reason("gsod", "tasmax", 0.0, {"attributes": "I"}) is None
 
 
 def test_negative_precipitation_is_rejected():
-    from observations import qc
+    from station_archive import qc
 
     assert qc.reject_reason("ecad", "pr", -5.0, {}) is not None
 
@@ -461,7 +535,7 @@ def test_gross_range_keeps_extremes_but_drops_the_impossible():
     Deliberately wide: an aggressive filter would delete the extremes a
     downscaling model and a bias-adjustment reference most need.
     """
-    from observations import qc
+    from station_archive import qc
 
     values = pd.Series([-45.0, 48.0, 200.0, np.nan])
     mask = qc.check_gross_range(values, "tasmax")
@@ -469,14 +543,41 @@ def test_gross_range_keeps_extremes_but_drops_the_impossible():
 
 
 def test_relative_humidity_bounds_enforced():
-    from observations import qc
+    from station_archive import qc
 
     mask = qc.check_gross_range(pd.Series([0.0, 50.0, 100.0, 105.0]), "hurs")
     assert list(mask) == [True, True, True, False]
 
 
+def test_a_variable_with_no_declared_range_still_rejects_nan():
+    """
+    The docstring's promise -- "NaN is treated as out of range so it cannot
+    reach the gold layer as an accepted value" -- has to hold for every
+    variable, not only the seven with bounds.
+
+    The silver layer deliberately carries dew_point, tavg_unspecified and
+    wind_max_sustained (standardize.CANONICAL_UNITS) so a later decision can
+    use them. None has a GROSS_RANGE entry, and the unbounded branch used to
+    return an all-True mask -- admitting NaN, and admitting the undocumented
+    sentinels this check exists to catch.
+    """
+    from station_archive import qc
+
+    values = pd.Series([12.0, np.nan, 999.0])
+    mask = qc.check_gross_range(values, "dew_point")
+    assert list(mask) == [True, False, True]     # NaN out; 999.0 not judged
+
+
+def test_every_variable_the_silver_layer_carries_is_covered_by_the_nan_guard():
+    from station_archive import qc, standardize
+
+    for variable in standardize.CANONICAL_UNITS:
+        mask = qc.check_gross_range(pd.Series([1.0, np.nan]), variable)
+        assert not bool(mask.iloc[1]), f"{variable} admitted NaN"
+
+
 def test_internal_consistency_flags_tmin_above_tmax():
-    from observations import qc
+    from station_archive import qc
 
     idx = pd.date_range("1990-01-01", periods=3, freq="D")
     out = qc.check_internal_consistency(
@@ -489,7 +590,7 @@ def test_internal_consistency_flags_tmin_above_tmax():
 
 
 def test_internal_consistency_flags_mean_outside_the_range():
-    from observations import qc
+    from station_archive import qc
 
     idx = pd.date_range("1990-01-01", periods=2, freq="D")
     out = qc.check_internal_consistency(
@@ -504,7 +605,7 @@ def test_internal_consistency_flags_mean_outside_the_range():
 
 def test_internal_consistency_ignores_days_with_missing_partners():
     """A station reporting tasmax but not tas is not inconsistent."""
-    from observations import qc
+    from station_archive import qc
 
     idx = pd.date_range("1990-01-01", periods=2, freq="D")
     out = qc.check_internal_consistency(
@@ -516,7 +617,7 @@ def test_internal_consistency_ignores_days_with_missing_partners():
 
 
 def test_repeated_days_detects_a_stuck_sensor():
-    from observations import qc
+    from station_archive import qc
 
     idx = pd.date_range("1990-01-01", periods=20, freq="D")
     values = pd.Series([20.0] * 12 + list(range(8)), index=idx, dtype="float64")
@@ -526,7 +627,7 @@ def test_repeated_days_detects_a_stuck_sensor():
 
 
 def test_coverage_summary_reports_missing_fraction_by_month():
-    from observations import qc
+    from station_archive import qc
 
     dates = pd.date_range("1990-01-01", periods=15, freq="D")
     values = pd.DataFrame({

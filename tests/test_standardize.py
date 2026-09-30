@@ -17,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from observations.standardize import (
+from station_archive.standardize import (
     GSOD_DAY_WINDOW_BIAS_CORRECTION,
     apply_day_window_correction,
 )

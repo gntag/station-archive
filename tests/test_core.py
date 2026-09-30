@@ -12,8 +12,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from observations import manifests, net, ziprange
-from observations.types import (
+from station_archive import settings
+from station_archive import manifests, net, ziprange
+from station_archive.types import (
     Domain,
     DownloadRequest,
     SchemaError,
@@ -27,7 +28,7 @@ from observations.types import (
 @pytest.fixture(autouse=True)
 def archive(tmp_path, monkeypatch):
     """Redirect the archive root so no test touches the real one."""
-    monkeypatch.setenv("STATION_ARCHIVE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path / "archive"))
     return tmp_path / "archive"
 
 
@@ -205,8 +206,8 @@ def test_download_raises_and_cleans_up_on_checksum_mismatch(tmp_path, monkeypatc
 
 
 def test_retries_are_bounded_and_then_raise(monkeypatch):
-    monkeypatch.setattr(net.config, "HTTP_RETRIES", 3)
-    monkeypatch.setattr(net.config, "HTTP_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(net.settings, "HTTP_RETRIES", 3)
+    monkeypatch.setattr(net.settings, "HTTP_BACKOFF_BASE", 0.0)
     attempts = []
 
     def failing():
@@ -221,7 +222,7 @@ def test_retries_are_bounded_and_then_raise(monkeypatch):
 def test_permanent_errors_are_not_retried(monkeypatch):
     from urllib.error import HTTPError
 
-    monkeypatch.setattr(net.config, "HTTP_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(net.settings, "HTTP_BACKOFF_BASE", 0.0)
     attempts = []
 
     def missing():
@@ -236,7 +237,7 @@ def test_permanent_errors_are_not_retried(monkeypatch):
 def test_access_refusal_surfaces_as_access_error(monkeypatch):
     from urllib.error import HTTPError
 
-    from observations.types import AccessError
+    from station_archive.types import AccessError
 
     def forbidden():
         raise HTTPError("https://x", 403, "Forbidden", {}, None)
@@ -484,3 +485,116 @@ def test_archive_checksum_is_order_independent():
     manifests.snapshots_path("ghcnd", "rel").unlink()
     record(["c", "b", "a"])
     assert manifests.archive_checksum("ghcnd", "rel") == first
+
+
+# ---------------------------------------------------------------------------
+# Release resolution
+#
+# GSOD publishes no version, so its release was a bare retrieval date. That
+# made a second day's `discover` register a release with no snapshots, which
+# latest_release then selected -- so every GSOD station resolved to an empty
+# series and the source silently vanished from the crosswalk and the gold
+# table, with only a miss count to show for it.
+# ---------------------------------------------------------------------------
+
+def _record_release(source, release, retrieved_at):
+    manifests.record_release(
+        SourceRelease(
+            source=source,
+            release=release,
+            retrieved_at=retrieved_at,
+            licence="l",
+            licence_url="u",
+            redistribution="unrestricted",
+        )
+    )
+
+
+def _record_snapshot(source, release, station_id, year=1985):
+    request = DownloadRequest(
+        source=source,
+        key=f"{source}/{year}/{station_id}",
+        relative_path=f"{year}/{station_id}.csv",
+        url="https://example/x",
+        metadata={"source_station_id": station_id, "year": year},
+    )
+    manifests.record_snapshot(
+        SourceSnapshot(
+            request=request,
+            path=Path(f"{year}/{station_id}.csv"),
+            sha256="abc",
+            n_bytes=10,
+            retrieved_at="2026-09-20T10:00:00+00:00",
+            release=release,
+            status="downloaded",
+        )
+    )
+
+
+def test_latest_release_prefers_a_release_that_has_snapshots():
+    from station_archive import bronze
+
+    _record_release("gsod", "retrieved-20260920", "2026-09-20T10:00:00+00:00")
+    _record_snapshot("gsod", "retrieved-20260920", "16716099999")
+    _record_release("gsod", "retrieved-20260926", "2026-09-26T09:00:00+00:00")
+
+    assert bronze.latest_release("gsod") == "retrieved-20260920"
+
+
+def test_stations_survive_a_later_discover_run():
+    """The failure this guards: a bare `discover` must not empty the source."""
+    from station_archive import bronze
+
+    _record_release("gsod", "retrieved-20260920", "2026-09-20T10:00:00+00:00")
+    _record_snapshot("gsod", "retrieved-20260920", "16716099999")
+    _record_release("gsod", "retrieved-20260926", "2026-09-26T09:00:00+00:00")
+
+    release = bronze.latest_release("gsod")
+    assert len(bronze.snapshots_by_station("gsod", release)) == 1
+
+
+def test_latest_release_falls_back_to_the_newest_when_none_has_snapshots():
+    from station_archive import bronze
+
+    _record_release("gsod", "retrieved-20260920", "2026-09-20T10:00:00+00:00")
+    _record_release("gsod", "retrieved-20260926", "2026-09-26T09:00:00+00:00")
+    assert bronze.latest_release("gsod") == "retrieved-20260926"
+
+
+def test_latest_release_is_none_for_an_unknown_source():
+    from station_archive import bronze
+
+    assert bronze.latest_release("gsod") is None
+
+
+def test_gsod_reuses_a_release_already_in_the_archive():
+    """
+    Idempotency is keyed on the release, so minting a new one every day would
+    re-download every station-year from NOAA and strand the old snapshots.
+    """
+    from station_archive.sources.gsod import GsodSource
+
+    _record_release("gsod", "retrieved-20260920", "2026-09-20T10:00:00+00:00")
+    _record_snapshot("gsod", "retrieved-20260920", "16716099999")
+
+    assert GsodSource().release() == "retrieved-20260920"
+
+
+def test_gsod_mints_a_release_for_an_empty_archive():
+    from datetime import datetime, timezone
+
+    from station_archive.sources.gsod import GsodSource
+
+    release = GsodSource().release()
+    assert release.startswith("retrieved-")
+    assert datetime.now(timezone.utc).strftime("%Y%m%d") in release
+
+
+def test_gsod_accepts_an_explicit_release():
+    """An explicit release is how a caller deliberately starts a new one."""
+    from station_archive.sources.gsod import GsodSource
+
+    _record_release("gsod", "retrieved-20260920", "2026-09-20T10:00:00+00:00")
+    _record_snapshot("gsod", "retrieved-20260920", "16716099999")
+
+    assert GsodSource(release="retrieved-20261001").release() == "retrieved-20261001"

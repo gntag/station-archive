@@ -17,12 +17,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from observations import net
-from observations.sources.c3s_land import C3sLandSource, VARIABLE_TO_CDS
-from observations.sources.ecad import EcadSource, _dms_to_degrees, _parse_stations
-from observations.sources.ghcnd import GhcndSource
-from observations.sources.gsod import GsodSource
-from observations.types import (
+from station_archive import settings
+from station_archive import net
+from station_archive.sources.c3s_land import C3sLandSource, VARIABLE_TO_CDS
+from station_archive.sources.ecad import EcadSource, _dms_to_degrees, _parse_stations
+from station_archive.sources.ghcnd import GhcndSource
+from station_archive.sources.gsod import GsodSource
+from station_archive.types import (
     Domain,
     DownloadRequest,
     SchemaError,
@@ -38,7 +39,7 @@ VARIABLES = ("tas", "tasmin", "tasmax", "pr", "hurs", "sfcWind", "gust")
 
 @pytest.fixture(autouse=True)
 def archive(tmp_path, monkeypatch):
-    monkeypatch.setenv("STATION_ARCHIVE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path / "archive"))
 
 
 def _snapshot(path: Path, source: str, release: str) -> SourceSnapshot:
@@ -130,7 +131,7 @@ def test_ghcnd_plan_is_one_request_per_station(ghcnd):
 
 
 def test_ghcnd_fixed_width_parser_rejects_short_lines():
-    from observations.sources.ghcnd import _parse_fixed_width, _STATION_FIELDS
+    from station_archive.sources.ghcnd import _parse_fixed_width, _STATION_FIELDS
 
     with pytest.raises(SchemaError, match="expected at least"):
         _parse_fixed_width("TOO SHORT\n", _STATION_FIELDS, "ghcnd-stations.txt")
@@ -398,7 +399,7 @@ def test_gsod_dewpoint_is_not_labelled_relative_humidity():
     Plan 1.4 allows deriving RH only where inputs and formula are recorded,
     which makes it a standardization step, not a download-time relabelling.
     """
-    from observations.sources.gsod import COLUMN_TO_VARIABLE
+    from station_archive.sources.gsod import COLUMN_TO_VARIABLE
 
     assert COLUMN_TO_VARIABLE["DEWP"] == "dew_point"
     assert "hurs" not in COLUMN_TO_VARIABLE.values()
@@ -469,11 +470,16 @@ def test_c3s_always_requests_dew_point_for_downstream_humidity():
     assert "dew_point_temperature" in C3sLandSource().cds_variables(("tas",))
 
 
-def test_c3s_plan_is_one_request_per_year(monkeypatch):
-    from observations import config
+def test_c3s_plan_is_one_request_per_year():
+    """
+    The fetch window is policy, so it arrives as an argument rather than being
+    read from a global -- which is what lets one process plan two windows.
+    """
+    from dataclasses import replace
 
-    monkeypatch.setattr(config, "FETCH_YEAR_START", 1990)
-    monkeypatch.setattr(config, "FETCH_YEAR_END", 1992)
+    from station_archive.policy import DEFAULT_POLICY
+
+    policy = replace(DEFAULT_POLICY, fetch_years=(1990, 1992))
     inventory = StationInventory.from_records(
         [
             {
@@ -484,7 +490,7 @@ def test_c3s_plan_is_one_request_per_year(monkeypatch):
             }
         ]
     )
-    requests = C3sLandSource().plan(inventory)
+    requests = C3sLandSource().plan(inventory, policy)
     assert [r.metadata["year"] for r in requests] == [1990, 1991, 1992]
     assert all(r.payload is not None and r.url is None for r in requests)
 
@@ -528,14 +534,14 @@ def test_ecad_release_is_reduced_to_an_iso_date():
     date_timestamp.txt holds a sentence; using it verbatim would put '&', '('
     and ',' into the archive directory name.
     """
-    from observations.sources.ecad import _release_date
+    from station_archive.sources.ecad import _release_date
 
     stamp = "EUROPEAN CLIMATE ASSESSMENT & DATASET (ECA&D), file created on 12-08-2026"
     assert _release_date(stamp) == "2026-08-12"
 
 
 def test_ecad_release_raises_when_no_date_is_present():
-    from observations.sources.ecad import _release_date
+    from station_archive.sources.ecad import _release_date
 
     with pytest.raises(SchemaError, match="no DD-MM-YYYY date"):
         _release_date("ECA&D archive, created recently")
@@ -547,7 +553,7 @@ def test_ghcnd_station_line_without_a_wmo_id_is_accepted():
     its name, and thousands of real lines are shorter than the nominal record
     width.  The optional trailing fields must read as empty, not raise.
     """
-    from observations.sources.ghcnd import (
+    from station_archive.sources.ghcnd import (
         _parse_fixed_width,
         _STATION_FIELDS,
         _STATION_REQUIRED_WIDTH,
@@ -567,7 +573,7 @@ def test_ghcnd_station_line_without_a_wmo_id_is_accepted():
 
 def test_ghcnd_station_line_truncated_mid_record_still_raises():
     """A genuine column shift must still be caught."""
-    from observations.sources.ghcnd import (
+    from station_archive.sources.ghcnd import (
         _parse_fixed_width,
         _STATION_FIELDS,
         _STATION_REQUIRED_WIDTH,
@@ -580,3 +586,21 @@ def test_ghcnd_station_line_truncated_mid_record_still_raises():
             "ghcnd-stations.txt",
             _STATION_REQUIRED_WIDTH,
         )
+
+
+def test_gsod_wmo_number_requires_a_usaf_id_ending_in_zero():
+    """
+    A GSOD filename is USAF + WBAN. The USAF id of a WMO station is the 5-digit
+    WMO number followed by '0'; any other sixth digit is a different station.
+    Taking the first five digits regardless gave 18 stations in the eastern
+    Mediterranean a WMO number belonging to someone else, and merged METHONI
+    with CYCLADES ISLANDS 327 km away.
+    """
+    from station_archive.sources.gsod import wmo_from_station_id
+
+    assert wmo_from_station_id("16734099999") == "16734"   # USAF 167340 -> WMO 16734
+    assert wmo_from_station_id("16734199999") == ""        # USAF 167341 -> a different site
+    assert wmo_from_station_id("16726399999") == ""
+    assert wmo_from_station_id("16597499999") == ""
+    assert wmo_from_station_id("03772099999") == "03772"   # leading zeros preserved
+    assert wmo_from_station_id("72509014739") == ""        # real WBAN, not a WMO filename

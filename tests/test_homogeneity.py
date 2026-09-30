@@ -13,10 +13,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from observations.homogeneity import (
+from station_archive.homogeneity import (
     FLAG_COLUMNS,
     FLAG_LAYER_COLUMNS,
-    MIN_DAYS_PER_MONTH,
     MIN_NEIGHBORS,
     MIN_NEIGHBOR_OVERLAP_MONTHS,
     MIN_SEGMENT_MONTHS,
@@ -102,6 +101,63 @@ def _monthly(n_months, seed=0, start="1990-01-01"):
 
 
 # ---------------------------------------------------------------------------
+# The permutation p-value floor
+# ---------------------------------------------------------------------------
+
+def test_permutation_p_value_is_never_exactly_zero():
+    """
+    A permutation test with n shuffles cannot resolve a p-value below
+    1/(n+1), so reporting 0.0 claims certainty the method does not have.
+    The conventional estimator is (1 + count) / (1 + n).
+
+    This matters because p feeds Benjamini-Hochberg. With p = 0 a strong break
+    passes BH at any rank; with the floor it must clear i/m * alpha, so on a
+    report where few series carry a break the two answers differ.
+    """
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("1985-01-01", periods=365 * 14, freq="D")
+    base = rng.normal(15.0, 3.0, len(idx))
+    target = base.copy()
+    target[len(idx) // 2:] += 12.0            # an unmistakable step
+    neighbors = {
+        f"n{i}": pd.Series(base + rng.normal(0, 0.3, len(idx)), index=idx)
+        for i in range(3)
+    }
+
+    result = detect_breakpoint(
+        "target", "tas", pd.Series(target, index=idx), neighbors,
+        n_permutations=99, seed=1,
+    )
+    assert result.status == "tested"
+    assert result.significant
+    assert result.p_value == pytest.approx(1 / 100)
+    assert result.p_value > 0.0
+
+
+def test_the_floor_is_the_only_change_to_a_middling_p_value():
+    """
+    A p-value with permutations above the observed statistic keeps the
+    (1 + count) / (1 + n) form and is not clamped to anything.
+    """
+    rng = np.random.default_rng(3)
+    idx = pd.date_range("1985-01-01", periods=365 * 14, freq="D")
+    base = rng.normal(15.0, 3.0, len(idx))
+    neighbors = {
+        f"n{i}": pd.Series(base + rng.normal(0, 0.3, len(idx)), index=idx)
+        for i in range(3)
+    }
+    result = detect_breakpoint(
+        "target", "tas", pd.Series(base, index=idx), neighbors,
+        n_permutations=49, seed=2,
+    )
+    assert result.status == "tested"
+    # No real break: p should sit well away from the floor, and be a multiple
+    # of 1/50 because that is the resolution 49 permutations provide.
+    assert result.p_value > 1 / 50
+    assert (result.p_value * 50) == pytest.approx(round(result.p_value * 50))
+
+
+# ---------------------------------------------------------------------------
 # to_monthly_anomalies
 # ---------------------------------------------------------------------------
 
@@ -123,6 +179,36 @@ def test_to_monthly_anomalies_drops_months_below_the_day_threshold():
     monthly = to_monthly_anomalies(series, "tas")
     assert len(monthly) == 1
     assert monthly.index[0].month == 1
+
+
+def test_to_monthly_anomalies_counts_values_not_rows():
+    """
+    The day threshold is about how many OBSERVATIONS built the monthly value,
+    so a NaN-padded month must not pass on its row count.
+
+    This gated on grouped.size(), which counts rows including NaN, while the
+    aggregation itself skips NaN -- so a 31-row January holding 5 real values
+    cleared a 20-day minimum and produced a "monthly mean" of five days. A
+    daily series reindexed to a complete calendar (asfreq, or a pivot) is the
+    ordinary way to arrive here, and nothing in the signature forbids it.
+    """
+    idx = pd.date_range("1990-01-01", periods=31, freq="D")
+    values = np.full(31, np.nan)
+    values[:5] = [1.0, 2.0, 3.0, 4.0, 50.0]
+    sparse = pd.Series(values, index=idx)
+    assert to_monthly_anomalies(sparse, "tas").empty
+
+    # 20 real values in the same 31-row month is enough, as it always was.
+    values[:20] = 1.0
+    assert len(to_monthly_anomalies(pd.Series(values, index=idx), "tas")) == 1
+
+
+def test_to_monthly_anomalies_unaffected_when_no_values_are_missing():
+    """The fix above must not move a dense series, which is every real case."""
+    idx = pd.date_range("1990-01-01", periods=120, freq="D")
+    dense = pd.Series(np.arange(120, dtype=float), index=idx)
+    monthly = to_monthly_anomalies(dense, "tas")
+    assert len(monthly) == 4
 
 
 def test_to_monthly_anomalies_sums_precipitation():
@@ -746,3 +832,118 @@ def test_benjamini_hochberg_more_conservative_than_uncorrected():
     rng = np.random.default_rng(0)
     p = rng.uniform(0, 1, 500)
     assert benjamini_hochberg(p, alpha=0.05).sum() <= (p < 0.05).sum()
+
+
+# ---------------------------------------------------------------------------
+# Neighbour support at the breakpoint
+#
+# The two-neighbour rule was checked against a whole-series count while the
+# SNHT search ran over months whose support could be 1, so a break belonging to
+# a NEIGHBOUR was reported as the target's with high confidence. Measured on
+# the real archive, 95 of 342 published flags had a detected break in a window
+# where only one neighbour contributed.
+# ---------------------------------------------------------------------------
+
+def _staggered_neighbours(n=_DEFAULT_DAYS, half=None, neighbour_break_at=None,
+                           neighbour_shift=4.0):
+    """
+    Two neighbours covering disjoint halves of the target's record, the second
+    of which moves partway through its own window -- so during that window the
+    only evidence about the target comes from a station that itself shifted.
+    """
+    half = n // 2 if half is None else half
+    a = _correlated_series(n=n, seed=2).iloc[:half]
+    values = _correlated_series(n=n, seed=3)
+    if neighbour_break_at is not None:
+        values = values.copy()
+        values.iloc[neighbour_break_at:] += neighbour_shift
+    return {"A": a, "B": values.iloc[half:]}
+
+
+def test_break_belonging_to_a_solo_neighbour_is_not_flagged():
+    target = _correlated_series(seed=1)          # the target is clean
+    neighbours = _staggered_neighbours(neighbour_break_at=2725)
+    result = detect_breakpoint("target", "tas", target, neighbours,
+                                n_permutations=200, seed=0)
+    assert result.n_neighbors_used == 2          # the whole-series count is met
+    assert not result.significant                # but the break window is not
+
+
+def test_result_reports_support_at_the_breakpoint():
+    target = _correlated_series(seed=1)
+    neighbours = _staggered_neighbours(neighbour_break_at=2725)
+    result = detect_breakpoint("target", "tas", target, neighbours,
+                                n_permutations=50, seed=0)
+    assert result.min_support_at_break < MIN_NEIGHBORS or result.breakpoint_date is None
+    assert result.n_months_min_support == 0      # no month has two neighbours here
+
+
+def test_fully_supported_break_is_still_found():
+    """Regression: the fix must not suppress a break the safeguard allows."""
+    bp = 2200
+    target = _correlated_series(seed=1, shift_after=bp, shift_amount=3.0)
+    neighbours = {f"n{i}": _correlated_series(seed=100 + i) for i in range(3)}
+    result = detect_breakpoint("target", "tas", target, neighbours,
+                                n_permutations=200, seed=0)
+    assert result.significant
+    assert result.min_support_at_break >= MIN_NEIGHBORS
+    assert result.n_months_min_support > 0
+    assert abs((result.breakpoint_date - target.index[bp]).days) < 45
+
+
+def test_support_is_counted_per_month_not_per_series():
+    from station_archive.homogeneity import (
+        neighbor_support, passing_neighbor_differences, to_monthly_anomalies,
+    )
+    target = _correlated_series(seed=1)
+    neighbours = _staggered_neighbours()
+    mt = to_monthly_anomalies(target, "tas")
+    mn = {k: to_monthly_anomalies(v, "tas") for k, v in neighbours.items()}
+    diffs = passing_neighbor_differences(mt, mn)
+    support = neighbor_support(diffs)
+    assert len(diffs) == 2                       # two neighbours passed overall
+    assert support.max() == 1                    # yet no single month has both
+
+
+# ---------------------------------------------------------------------------
+# Neighbour candidates must be filtered by data before being truncated
+# ---------------------------------------------------------------------------
+
+def test_neighbours_are_filtered_by_data_before_truncation():
+    """
+    The five nearest stations were chosen from ALL canonical stations and only
+    then checked for the variable, so a station ringed by neighbours that lack
+    it was reported untestable while usable neighbours sat inside the radius.
+    On the real archive this cost 84 of 126 otherwise-testable gust stations.
+    """
+    near_without_data = {f"empty{i}": None for i in range(5)}
+    series = {"target": _correlated_series(seed=1),
+              "far1": _correlated_series(seed=2),
+              "far2": _correlated_series(seed=3)}
+    rows = [{"canonical_station_id": "target", "lat": 38.00, "lon": 24.0}]
+    for i, name in enumerate(near_without_data):
+        rows.append({"canonical_station_id": name, "lat": 38.01 + i * 0.001, "lon": 24.0})
+    rows.append({"canonical_station_id": "far1", "lat": 38.20, "lon": 24.0})
+    rows.append({"canonical_station_id": "far2", "lat": 38.25, "lon": 24.0})
+    stations_meta = pd.DataFrame(rows)
+    values = _archive_frame(series)
+
+    report = run_report(values, stations_meta, ["tas"], n_permutations=20, seed=0)
+    reached = set(report["canonical_station_id"])
+    assert "target" in reached, "target was skipped although two usable neighbours exist"
+    assert int(report.loc[report.canonical_station_id == "target",
+                          "n_neighbors_used"].iloc[0]) == 2
+
+
+# ---------------------------------------------------------------------------
+# One dedupe rule for both flag appliers
+# ---------------------------------------------------------------------------
+
+def test_flag_layer_keeps_one_row_per_station_variable():
+    report = pd.DataFrame([
+        _report_row("a", breakpoint_date="1999-01-01"),
+        _report_row("a", breakpoint_date="1996-01-01"),
+    ])
+    layer = build_flag_layer(report)
+    assert len(layer) == 1
+    assert layer.iloc[0]["breakpoint_date"] == pd.Timestamp("1996-01-01")

@@ -15,8 +15,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from observations import config, identity, standardize
-from observations.identity import (
+from station_archive import identity, standardize
+from station_archive.policy import DEFAULT_POLICY
+from station_archive.identity import (
     MatchPair,
     OverlapStats,
     StationRecord,
@@ -35,7 +36,7 @@ from observations.identity import (
     overlap_statistics,
     records_from_inventories,
 )
-from observations.types import INVENTORY_COLUMNS, StationInventory
+from station_archive.types import INVENTORY_COLUMNS, StationInventory
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ def test_candidates_only_pair_across_sources():
         _station("ecad", "2", 37.901, 23.701),
         _station("ghcnd", "G", 37.900, 23.700),
     ]
-    pairs = candidate_pairs(records, config.IDENTITY_NEAR_DEG)
+    pairs = candidate_pairs(records, DEFAULT_POLICY.identity.near_deg)
     assert all(a.source != b.source for a, b in pairs)
 
 
@@ -221,7 +222,7 @@ def test_candidates_find_neighbours_across_bucket_boundaries():
     Two stations metres apart but on opposite sides of a bucket edge must
     still be compared, or the blocking would silently lose real duplicates.
     """
-    tol = config.IDENTITY_NEAR_DEG
+    tol = DEFAULT_POLICY.identity.near_deg
     edge = math.floor(37.9 / tol) * tol
     records = [
         _station("ecad", "1", edge - tol / 1000, 23.7),
@@ -235,7 +236,7 @@ def test_distant_stations_are_not_candidates():
         _station("ecad", "1", 37.9, 23.7),
         _station("ghcnd", "G", 35.3, 25.1),
     ]
-    assert candidate_pairs(records, config.IDENTITY_NEAR_DEG) == []
+    assert candidate_pairs(records, DEFAULT_POLICY.identity.near_deg) == []
 
 
 def test_candidate_generation_is_deterministic():
@@ -244,8 +245,8 @@ def test_candidate_generation_is_deterministic():
         _station("ghcnd", "G", 37.901, 23.701),
         _station("gsod", "S", 37.902, 23.702),
     ]
-    first = [(a.key, b.key) for a, b in candidate_pairs(records, config.IDENTITY_NEAR_DEG)]
-    second = [(a.key, b.key) for a, b in candidate_pairs(records, config.IDENTITY_NEAR_DEG)]
+    first = [(a.key, b.key) for a, b in candidate_pairs(records, DEFAULT_POLICY.identity.near_deg)]
+    second = [(a.key, b.key) for a, b in candidate_pairs(records, DEFAULT_POLICY.identity.near_deg)]
     assert first == second
 
 
@@ -254,7 +255,7 @@ def test_candidates_skip_stations_without_coordinates():
         _station("ecad", "1", float("nan"), float("nan")),
         _station("ghcnd", "G", 37.9, 23.7),
     ]
-    assert candidate_pairs(records, config.IDENTITY_NEAR_DEG) == []
+    assert candidate_pairs(records, DEFAULT_POLICY.identity.near_deg) == []
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +619,7 @@ def test_transitive_group_is_flagged_for_review():
     A links to B and B to C, but A and C were never accepted directly.
     Section 1.3 gives no rule for chained links, so the group is flagged.
     """
-    from observations.identity import _DisjointSet, _assemble
+    from station_archive.identity import _DisjointSet, _assemble
 
     records = {
         "ecad:1": _station("ecad", "1", 37.9000, 23.7000),
@@ -641,7 +642,7 @@ def test_transitive_group_is_flagged_for_review():
 
 
 def test_disjoint_set_representative_is_deterministic():
-    from observations.identity import _DisjointSet
+    from station_archive.identity import _DisjointSet
 
     first, second = _DisjointSet(), _DisjointSet()
     first.union("b", "a")
@@ -725,7 +726,7 @@ def test_accepted_merge_with_poor_value_agreement_is_flagged():
     Correlation measures covariation, not agreement.  A merge can clear
     r>=0.95 while the two records differ by more than a degree every day.
     """
-    from observations.identity import agreement_needs_review
+    from station_archive.identity import agreement_needs_review
 
     good = OverlapStats("tasmax", 800, 0.999, 0.0, 0.02, 0.99)
     poor = OverlapStats("tasmax", 800, 0.981, -1.3, 1.31, 0.03)
@@ -735,14 +736,14 @@ def test_accepted_merge_with_poor_value_agreement_is_flagged():
 
 def test_agreement_review_threshold_is_per_unit():
     """2 mm of precipitation disagreement is not 2 degC of temperature."""
-    from observations.identity import agreement_needs_review
+    from station_archive.identity import agreement_needs_review
 
     assert not agreement_needs_review(OverlapStats("pr", 800, 0.99, 0.0, 1.5, 0.5))
     assert agreement_needs_review(OverlapStats("tasmax", 800, 0.99, 0.0, 1.5, 0.5))
 
 
 def test_identical_records_are_recognised():
-    from observations.identity import records_are_identical
+    from station_archive.identity import records_are_identical
 
     assert records_are_identical(OverlapStats("tasmax", 3210, 1.0, 0.0, 0.0, 1.0))
     assert not records_are_identical(OverlapStats("tasmax", 3210, 0.99, 0.2, 0.74, 0.06))
@@ -754,7 +755,7 @@ def test_metadata_conflict_reported_when_series_identical_but_elevation_differs(
     a metadata error, not two stations -- and elevation is a model predictor,
     so it must surface rather than be silently absorbed.
     """
-    from observations.identity import metadata_conflicts
+    from station_archive.identity import metadata_conflicts
 
     stats = OverlapStats("tasmax", 7670, 1.0, 0.0, 0.0, 1.0)
     evidence = [
@@ -768,7 +769,7 @@ def test_metadata_conflict_reported_when_series_identical_but_elevation_differs(
 
 
 def test_no_conflict_reported_when_metadata_agrees():
-    from observations.identity import metadata_conflicts
+    from station_archive.identity import metadata_conflicts
 
     stats = OverlapStats("tasmax", 3000, 1.0, 0.0, 0.0, 1.0)
     evidence = [
@@ -780,7 +781,7 @@ def test_no_conflict_reported_when_metadata_agrees():
 
 def test_merely_similar_stations_are_not_called_a_metadata_conflict():
     """Distinct nearby stations at different elevations are not an error."""
-    from observations.identity import metadata_conflicts
+    from station_archive.identity import metadata_conflicts
 
     stats = OverlapStats("tasmax", 1208, 0.9916, -1.2, 1.289, 0.0099)
     evidence = [
@@ -850,7 +851,7 @@ def test_conflict_queue_requires_the_minimum_overlap():
     One shared day that happens to agree is not evidence that two archives
     describe one instrument; it would only put noise in the review queue.
     """
-    from observations.identity import metadata_conflicts
+    from station_archive.identity import metadata_conflicts
 
     one_day = OverlapStats("tasmax", 1, float("nan"), 0.0, 0.0, 1.0)
     evidence = [
@@ -906,7 +907,7 @@ def _alias_row(cid, source, sid, lat, lon, elev, name="X", variables="tasmax", r
 
 
 def test_metadata_winner_is_the_alias_with_most_observations():
-    from observations.identity import resolve_canonical_metadata
+    from station_archive.identity import resolve_canonical_metadata
 
     aliases = pd.DataFrame([
         _alias_row("c:1", "ecad", "1", 37.90, 23.70, 31.0, name="LONG"),
@@ -928,7 +929,7 @@ def test_metadata_fields_come_from_one_alias_as_a_block():
     Mixing fields from different winners could manufacture a
     coordinate/elevation pair no archive ever published.
     """
-    from observations.identity import resolve_canonical_metadata
+    from station_archive.identity import resolve_canonical_metadata
 
     aliases = pd.DataFrame([
         _alias_row("c:1", "ecad", "1", 37.90, 23.70, 31.0),
@@ -945,7 +946,7 @@ def test_metadata_fields_come_from_one_alias_as_a_block():
 
 
 def test_metadata_resolution_is_deterministic_on_ties():
-    from observations.identity import resolve_canonical_metadata
+    from station_archive.identity import resolve_canonical_metadata
 
     aliases = pd.DataFrame([
         _alias_row("c:1", "gsod", "S", 1.0, 1.0, 10.0),
@@ -962,7 +963,7 @@ def test_metadata_resolution_is_deterministic_on_ties():
 
 
 def test_single_source_station_needs_no_contest():
-    from observations.identity import resolve_canonical_metadata
+    from station_archive.identity import resolve_canonical_metadata
 
     aliases = pd.DataFrame([_alias_row("c:1", "ecad", "1", 37.9, 23.7, 100.0)])
     out = resolve_canonical_metadata(aliases, FakeLoader(), variables=("tasmax",))
@@ -971,7 +972,7 @@ def test_single_source_station_needs_no_contest():
 
 
 def test_resolution_records_the_full_contest_for_audit():
-    from observations.identity import resolve_canonical_metadata
+    from station_archive.identity import resolve_canonical_metadata
 
     aliases = pd.DataFrame([
         _alias_row("c:1", "ecad", "1", 37.90, 23.70, 31.0),
@@ -1042,7 +1043,7 @@ def test_overlap_in_any_variable_escapes_the_never_merge_rule():
 
 
 def test_total_overlap_counts_across_every_variable():
-    from observations.identity import total_overlap_days
+    from station_archive.identity import total_overlap_days
 
     loader = FakeLoader({
         ("ecad", "1", "tasmax"): _daily([1.0] * 10, start="1990-01-01"),
@@ -1131,3 +1132,462 @@ def test_decisions_other_than_yes_or_no_are_ignored():
         decisions={("ecad:000247", "ghcnd:GRE00105241"): "maybe later"},
     )
     assert crosswalk.n_canonical() == 2
+
+
+# ---------------------------------------------------------------------------
+# Reviewer decisions on IDENTIFIER-tier pairs
+#
+# These are the pairs the workbook's Already_merged and Beyond_radius sheets
+# offer a decision on. The tier-1 links are applied before the candidate loop
+# and excluded from it, so the override used to be read and then dropped: 156
+# accepted identifier merges and one too-far refusal in the published archive
+# carried a DECISION_merge column that could not act.
+# ---------------------------------------------------------------------------
+
+def _identifier_inventories():
+    """A c3s_land/ghcnd pair sharing an exact GHCN-D identifier: tier 1."""
+    return {
+        "ghcnd": _inventory(
+            [dict(source="ghcnd", source_station_id="GRE00105241", name="ATHENS",
+                  lat=37.9000, lon=23.7500, elevation_m=107, variable="tasmax")]
+        ),
+        "c3s_land": _inventory(
+            [dict(source="c3s_land", source_station_id="GRE00105241", name="ATHENS",
+                  lat=37.9000, lon=23.7500, elevation_m=107, variable="tasmax")]
+        ),
+    }
+
+
+_IDENTIFIER_PAIR = ("c3s_land:GRE00105241", "ghcnd:GRE00105241")
+
+
+def test_the_pair_under_test_really_is_tier_one():
+    """Guards the two tests below: if this stops being tier 1 they prove nothing."""
+    crosswalk = build_crosswalk(_identifier_inventories(), FakeLoader())
+    assert list(crosswalk.evidence["tier"]) == [TIER_IDENTIFIER]
+    assert crosswalk.n_canonical() == 1
+
+
+def test_reviewer_no_splits_an_identifier_merge():
+    """
+    'Write no in DECISION_merge to split one' is what the workbook's summary
+    sheet promises for Already_merged, which lists every automatic merge --
+    identifier merges included.
+    """
+    crosswalk = build_crosswalk(
+        _identifier_inventories(), FakeLoader(),
+        decisions={_IDENTIFIER_PAIR: "no"},
+    )
+    assert crosswalk.n_canonical() == 2
+    assert crosswalk.evidence["reason"].str.contains("reviewer decision").any()
+
+
+def test_reviewer_yes_merges_an_identifier_pair_rejected_as_too_far():
+    """
+    match_tier1_identifier's own docstring: a pair that fails the distance
+    check 'appears in the review workbook, where a reviewer can overturn it'.
+    """
+    inventories = {
+        "ghcnd": _inventory(
+            [dict(source="ghcnd", source_station_id="GR000167460", name="METHONI",
+                  lat=36.83, lon=21.70, elevation_m=52, wmo_id="16746",
+                  variable="tasmax")]
+        ),
+        "gsod": _inventory(
+            [dict(source="gsod", source_station_id="16746099999", name="METHONI",
+                  lat=36.88, lon=21.70, elevation_m=52, wmo_id="16746",
+                  variable="tasmax")]
+        ),
+    }
+    pair = ("ghcnd:GR000167460", "gsod:16746099999")
+
+    refused = build_crosswalk(inventories, FakeLoader())
+    assert refused.n_canonical() == 2
+    assert not refused.evidence["accepted"].any()
+
+    overturned = build_crosswalk(inventories, FakeLoader(), decisions={pair: "yes"})
+    assert overturned.n_canonical() == 1
+    assert overturned.evidence["reason"].str.contains("reviewer decision").any()
+
+
+def test_an_overturned_identifier_pair_keeps_the_automated_verdict_on_record():
+    """
+    The evidence table must say both things: what the rules concluded and that
+    a human overruled them. A reason that recorded only the human decision
+    would erase the basis for revisiting it.
+
+    The tier deliberately stays as the rules assigned it, so a reader cannot
+    mistake a human decision for machine evidence.
+    """
+    crosswalk = build_crosswalk(
+        _identifier_inventories(), FakeLoader(),
+        decisions={_IDENTIFIER_PAIR: "no"},
+    )
+    reason = crosswalk.evidence["reason"].iloc[0]
+    assert reason.startswith("reviewer decision: do not merge")
+    assert "exact ghcnd_id identifier GRE00105241" in reason
+    assert list(crosswalk.evidence["tier"]) == [TIER_IDENTIFIER]
+
+
+def test_an_undecided_identifier_pair_is_untouched():
+    """A decision about some other pair must not leak onto this one."""
+    crosswalk = build_crosswalk(
+        _identifier_inventories(), FakeLoader(),
+        decisions={("ecad:000247", "ghcnd:GRE00105241"): "no"},
+    )
+    assert crosswalk.n_canonical() == 1
+    assert not crosswalk.evidence["reason"].str.contains("reviewer").any()
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 distance sanity check
+#
+# An exact identifier used to merge with no distance test whatsoever. On the
+# real archive that merged METHONI with CYCLADES ISLANDS 327 km apart, KALAMATA
+# with MIKONOS and SYROS, and HERAKLION with KARPATHOS -- because 18 GSOD
+# stations carried a WMO number belonging to a different station.
+# ---------------------------------------------------------------------------
+
+def test_identifier_match_beyond_the_distance_gate_is_refused():
+    records = [
+        _station("ghcnd", "GR000016734", 36.8331, 21.7000, wmo="16734"),
+        _station("gsod", "16734199999", 37.0833, 25.3667, wmo="16734"),
+    ]
+    pairs = match_tier1_identifier(records)
+    assert len(pairs) == 1
+    assert not pairs[0].accepted
+    assert pairs[0].tier == TIER_UNRESOLVED
+    assert "km apart" in pairs[0].reason
+    assert "16734" in pairs[0].reason      # the identifier is still named
+
+
+def test_identifier_match_within_the_gate_still_merges():
+    records = [
+        _station("ghcnd", "GR000016716", 37.9000, 23.7500, wmo="16716"),
+        _station("gsod", "16716099999", 37.8822, 23.7348, wmo="16716"),
+    ]
+    pairs = match_tier1_identifier(records)
+    assert len(pairs) == 1
+    assert pairs[0].accepted
+    assert pairs[0].tier == TIER_IDENTIFIER
+
+
+def test_identifier_distance_gate_ignores_elevation():
+    """Elevation is deliberately not part of this check."""
+    a = _station("ghcnd", "X", 37.9000, 23.7500, elev=10.0, wmo="16716")
+    b = _station("gsod", "16716099999", 37.9005, 23.7505, elev=900.0, wmo="16716")
+    pairs = match_tier1_identifier([a, b])
+    assert pairs[0].accepted
+
+
+def test_identifier_match_with_missing_coordinates_is_not_refused():
+    """A source publishing no coordinates must not lose its identifier link."""
+    a = _station("ghcnd", "X", float("nan"), float("nan"), wmo="16716")
+    b = _station("gsod", "16716099999", 37.9, 23.7, wmo="16716")
+    pairs = match_tier1_identifier([a, b])
+    assert pairs[0].accepted
+    assert "distance unknown" in pairs[0].reason
+
+
+def test_refused_identifier_pair_raises_duplicate_risk_on_both():
+    inventories = {
+        "ghcnd": _inventory([dict(source="ghcnd", source_station_id="GR000016734",
+                                  name="METHONI", lat=36.8331, lon=21.7,
+                                  elevation_m=52, variable="tasmax", wmo_id="16734")]),
+        "gsod": _inventory([dict(source="gsod", source_station_id="16734199999",
+                                 name="CYCLADES ISLANDS", lat=37.0833, lon=25.3667,
+                                 elevation_m=3, variable="tasmax", wmo_id="16734")]),
+    }
+    crosswalk = build_crosswalk(inventories, FakeLoader())
+    assert crosswalk.n_canonical() == 2             # not merged
+    assert crosswalk.aliases["duplicate_risk"].all()
+
+
+# ---------------------------------------------------------------------------
+# Visibility of merges nobody approved
+# ---------------------------------------------------------------------------
+
+def _accepted_evidence():
+    import pandas as pd
+    return pd.DataFrame([
+        {"left": "ecad:1", "right": "ghcnd:A", "tier": TIER_IDENTIFIER,
+         "tier_name": "exact_identifier", "accepted": True, "distance_km": 0.02,
+         "elevation_diff_m": 1.0, "name_similarity": 1.0,
+         "reason": "exact wmo identifier 16716", "match_variable": "",
+         "n_overlap_days": 0, "correlation": float("nan"), "bias": float("nan"),
+         "mean_abs_diff": float("nan"), "exact_fraction": float("nan")},
+        {"left": "ecad:2", "right": "gsod:B", "tier": TIER_NEAR,
+         "tier_name": "near_coordinates_plus_series", "accepted": True,
+         "distance_km": 2.4, "elevation_diff_m": 40.0, "name_similarity": 0.0,
+         "reason": "2.40 km apart, elevation within 40 m, tasmax r=0.999 over 900 days",
+         "match_variable": "tasmax", "n_overlap_days": 900, "correlation": 0.999,
+         "bias": 0.0, "mean_abs_diff": 0.02, "exact_fraction": 0.99},
+        {"left": "ecad:3", "right": "gsod:C", "tier": TIER_NEAR,
+         "tier_name": "near_coordinates_plus_series", "accepted": True,
+         "distance_km": 0.5, "elevation_diff_m": 2.0, "name_similarity": 0.9,
+         "reason": "reviewer decision: merge (automated gate said: only 0 usable days)",
+         "match_variable": "tasmax", "n_overlap_days": 0, "correlation": float("nan"),
+         "bias": float("nan"), "mean_abs_diff": float("nan"),
+         "exact_fraction": float("nan")},
+    ])
+
+
+def test_review_lists_merges_made_without_approval():
+    import pandas as pd
+    from station_archive import review as review_module
+
+    aliases = pd.DataFrame([
+        _alias_row("ecad:1", "ecad", "1", 37.9, 23.7, 10.0),
+        _alias_row("ecad:1", "ghcnd", "A", 37.9, 23.7, 11.0),
+        _alias_row("ecad:2", "ecad", "2", 38.0, 24.0, 10.0),
+        _alias_row("ecad:2", "gsod", "B", 38.02, 24.0, 50.0),
+        _alias_row("ecad:3", "ecad", "3", 39.0, 25.0, 10.0),
+        _alias_row("ecad:3", "gsod", "C", 39.0, 25.0, 12.0),
+    ])
+    sheets = review_module.build_review(
+        _accepted_evidence(), aliases, FakeLoader(), progress=False
+    )
+    assert "Already_merged" in sheets
+    tab = sheets["Already_merged"]
+    pairs = set(zip(tab["left"], tab["right"]))
+    assert ("ecad:1", "ghcnd:A") in pairs          # automatic, identifier
+    assert ("ecad:2", "gsod:B") in pairs           # automatic, series
+    assert ("ecad:3", "gsod:C") not in pairs       # you approved this one
+
+
+def test_already_merged_tab_carries_a_decision_column():
+    import pandas as pd
+    from station_archive import review as review_module
+
+    aliases = pd.DataFrame([
+        _alias_row("ecad:1", "ecad", "1", 37.9, 23.7, 10.0),
+        _alias_row("ecad:1", "ghcnd", "A", 37.9, 23.7, 11.0),
+    ])
+    tab = review_module.build_review(
+        _accepted_evidence().head(1), aliases, FakeLoader(), progress=False
+    )["Already_merged"]
+    for column in review_module.DECISION_COLUMNS:
+        assert column in tab.columns
+    assert (tab[list(review_module.DECISION_COLUMNS)] == "").all().all()
+
+
+def test_already_merged_tab_puts_the_least_defensible_first():
+    import pandas as pd
+    from station_archive import review as review_module
+
+    aliases = pd.DataFrame([
+        _alias_row("ecad:1", "ecad", "1", 37.9, 23.7, 10.0),
+        _alias_row("ecad:1", "ghcnd", "A", 37.9, 23.7, 11.0),
+        _alias_row("ecad:2", "ecad", "2", 38.0, 24.0, 10.0),
+        _alias_row("ecad:2", "gsod", "B", 38.02, 24.0, 50.0),
+    ])
+    tab = review_module.build_review(
+        _accepted_evidence().head(2), aliases, FakeLoader(), progress=False
+    )["Already_merged"]
+    assert tab.iloc[0]["right"] == "gsod:B"        # 2.4 km beats 0.02 km
+
+
+def test_decisions_are_read_from_every_decision_sheet(tmp_path):
+    """
+    The Beyond_radius sheet used to carry a decision column that nothing read,
+    so a reviewer could fill it in and change nothing.
+    """
+    import pandas as pd
+
+    path = tmp_path / "wb.xlsx"
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame([{"left": "ecad:1", "right": "ghcnd:A",
+                       "DECISION_merge": "yes"}]).to_excel(
+            writer, sheet_name="Review", index=False)
+        pd.DataFrame([{"left": "ecad:2", "right": "gsod:B",
+                       "DECISION_merge": "no"}]).to_excel(
+            writer, sheet_name="Already_merged", index=False)
+        pd.DataFrame([{"left": "ecad:9", "right": "gsod:Z",
+                       "DECISION_merge": "yes"}]).to_excel(
+            writer, sheet_name="Beyond_radius", index=False)
+
+    decisions = identity.load_decisions(path)
+    assert decisions[("ecad:1", "ghcnd:A")] == "yes"
+    assert decisions[("ecad:2", "gsod:B")] == "no"
+    assert decisions[("ecad:9", "gsod:Z")] == "yes"
+
+
+def test_load_decisions_tolerates_a_workbook_without_the_new_sheet(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "old.xlsx"
+    pd.DataFrame([{"left": "ecad:1", "right": "ghcnd:A",
+                   "DECISION_merge": "yes"}]).to_excel(
+        path, sheet_name="Review", index=False)
+    assert identity.load_decisions(path) == {("ecad:1", "ghcnd:A"): "yes"}
+
+
+def test_refusing_an_automatic_merge_unmerges_it():
+    values = [100.0 + (i % 37) * 4.0 for i in range(800)]
+    loader = FakeLoader({
+        ("ecad", "000247", "tasmax"): _daily(values),
+        ("ghcnd", "GRE00105241", "tasmax"): _daily(values),
+    })
+    assert build_crosswalk(_decision_inventories(), loader).n_canonical() == 1
+    refused = build_crosswalk(
+        _decision_inventories(), loader,
+        decisions={("ecad:000247", "ghcnd:GRE00105241"): "no"},
+    )
+    assert refused.n_canonical() == 2
+    assert refused.aliases["duplicate_risk"].all()
+
+
+def test_rebuilding_the_workbook_keeps_decisions_already_made(tmp_path):
+    """
+    Regenerating the workbook used to blank every DECISION_merge, so a rebuild
+    silently destroyed the reviewer's work -- which is why hand-made backup
+    copies of it accumulate beside it. Decisions already made must survive.
+    """
+    import pandas as pd
+    from station_archive import review as review_module
+
+    path = tmp_path / "wb.xlsx"
+    review_module.write_workbook(path, {
+        "Review": pd.DataFrame([{"left": "ecad:1", "right": "ghcnd:A",
+                                 "DECISION_merge": "yes", "DECISION_note": "same site"}]),
+    })
+    previous = identity.load_decisions(path)
+    assert previous == {("ecad:1", "ghcnd:A"): "yes"}
+
+    rebuilt = review_module.carry_forward_decisions(
+        {"Review": pd.DataFrame([
+            {"left": "ecad:1", "right": "ghcnd:A", "DECISION_merge": "", "DECISION_note": ""},
+            {"left": "ecad:2", "right": "ghcnd:B", "DECISION_merge": "", "DECISION_note": ""},
+        ])},
+        previous,
+    )
+    row = rebuilt["Review"].set_index(["left", "right"]).loc[("ecad:1", "ghcnd:A")]
+    assert row["DECISION_merge"] == "yes"
+    assert rebuilt["Review"].set_index(["left", "right"]).loc[
+        ("ecad:2", "ghcnd:B"), "DECISION_merge"] == ""
+
+
+def test_carrying_decisions_forward_ignores_sheets_without_the_column():
+    import pandas as pd
+    from station_archive import review as review_module
+
+    sheets = {"Per_variable": pd.DataFrame([{"left": "a", "right": "b", "variable": "tas"}])}
+    out = review_module.carry_forward_decisions(sheets, {("a", "b"): "yes"})
+    assert "DECISION_merge" not in out["Per_variable"].columns
+
+
+def test_a_decision_survives_even_when_its_pair_is_no_longer_offered():
+    """
+    A 'yes' decision merges a pair, so the next rebuild presents it nowhere:
+    not in Review (it is no longer rejected) and not in Already_merged (which
+    excludes reviewer-decided pairs). Without a durable ledger the decision
+    vanishes, and the merge it authorised is silently lost on the next run.
+    """
+    import pandas as pd
+    from station_archive import review as review_module
+
+    sheets = {"Review": pd.DataFrame([
+        {"left": "ecad:2", "right": "ghcnd:B", "DECISION_merge": "", "DECISION_note": ""},
+    ])}
+    previous = {("ecad:1", "ghcnd:A"): "yes", ("ecad:2", "ghcnd:B"): "no"}
+    out = review_module.carry_forward_decisions(sheets, previous)
+
+    assert "Decisions" in out
+    ledger = out["Decisions"].set_index(["left", "right"])
+    assert ledger.loc[("ecad:1", "ghcnd:A"), "DECISION_merge"] == "yes"
+    assert ledger.loc[("ecad:2", "ghcnd:B"), "DECISION_merge"] == "no"
+    assert not ledger.loc[("ecad:1", "ghcnd:A"), "still_offered"]
+    assert ledger.loc[("ecad:2", "ghcnd:B"), "still_offered"]
+
+
+def test_the_ledger_is_read_back_as_a_decision_source(tmp_path):
+    import pandas as pd
+    from station_archive import review as review_module
+
+    path = tmp_path / "wb.xlsx"
+    review_module.write_workbook(path, {
+        "Decisions": pd.DataFrame([{"left": "ecad:1", "right": "ghcnd:A",
+                                    "DECISION_merge": "yes", "still_offered": False}]),
+    })
+    assert identity.load_decisions(path) == {("ecad:1", "ghcnd:A"): "yes"}
+
+
+def test_blank_decisions_stay_blank_not_nan():
+    import pandas as pd
+    from station_archive import review as review_module
+
+    sheets = {"Review": pd.DataFrame([
+        {"left": "a", "right": "b", "DECISION_merge": float("nan"), "DECISION_note": ""},
+    ])}
+    out = review_module.carry_forward_decisions(sheets, {("x", "y"): "yes"})
+    assert out["Review"].loc[0, "DECISION_merge"] == ""
+
+
+# ---------------------------------------------------------------------------
+# A recorded conflict should say how it was resolved
+# ---------------------------------------------------------------------------
+
+def test_conflicts_record_which_alias_supplied_the_coordinates():
+    """
+    metadata_conflicts.csv said two archives disagree and stopped there, so a
+    reader could not tell which coordinate the archive actually uses. The rule
+    is the alias with the most observations across all variables; the file now
+    says so, per row, with the count behind it.
+    """
+    import pandas as pd
+    from station_archive.identity import annotate_conflicts
+
+    conflicts = pd.DataFrame([
+        {"left": "ecad:1", "right": "gsod:B", "conflict": "coordinates",
+         "distance_km": 1.2, "elevation_diff_m": 3.0},
+    ])
+    aliases = pd.DataFrame([
+        _alias_row("c:1", "ecad", "1", 37.90, 23.70, 10.0),
+        _alias_row("c:1", "gsod", "B", 37.91, 23.71, 13.0),
+    ])
+    canonical = pd.DataFrame([{
+        "canonical_station_id": "c:1", "metadata_source": "gsod:B",
+        "metadata_n_observations": 39239, "lat": 37.91, "lon": 23.71,
+        "elevation_m": 13.0,
+        "selection": "gsod:B(39239) > ecad:1(38325)",
+    }])
+    out = annotate_conflicts(conflicts, aliases, canonical)
+    row = out.iloc[0]
+    assert row["coordinates_used_from"] == "gsod:B"
+    assert row["coordinates_used_n_obs"] == 39239
+    assert row["coordinates_used_side"] == "right"
+    assert row["lat_used"] == 37.91 and row["lon_used"] == 23.71
+    assert "most observations" in row["coordinate_rule"]
+
+
+def test_conflict_resolution_names_a_third_alias_when_one_wins():
+    """A group can have more than two aliases, and the winner may be neither
+    side of the reported pair."""
+    import pandas as pd
+    from station_archive.identity import annotate_conflicts
+
+    conflicts = pd.DataFrame([
+        {"left": "ecad:2", "right": "gsod:C", "conflict": "coordinates",
+         "distance_km": 0.7, "elevation_diff_m": 14.0},
+    ])
+    aliases = pd.DataFrame([
+        _alias_row("c:9", "ecad", "2", 35.42, 27.14, 20.0),
+        _alias_row("c:9", "gsod", "C", 35.43, 27.15, 6.0),
+        _alias_row("c:9", "ecad", "3", 35.42, 27.14, 20.0),
+    ])
+    canonical = pd.DataFrame([{
+        "canonical_station_id": "c:9", "metadata_source": "ecad:3",
+        "metadata_n_observations": 13696, "lat": 35.42, "lon": 27.14,
+        "elevation_m": 20.0, "selection": "ecad:3(13696) > ecad:2(13696)",
+    }])
+    out = annotate_conflicts(conflicts, aliases, canonical)
+    assert out.iloc[0]["coordinates_used_side"] == "another alias"
+    assert out.iloc[0]["coordinates_used_from"] == "ecad:3"
+
+
+def test_annotating_an_empty_conflict_table_is_harmless():
+    import pandas as pd
+    from station_archive.identity import annotate_conflicts
+
+    out = annotate_conflicts(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    assert out.empty

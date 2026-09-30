@@ -1,0 +1,74 @@
+cff-version: 1.2.0
+title: "station-archive: a reconciled daily station-observation archive builder"
+message: >-
+  If you use this software, or an archive built with it, please cite it.
+  When you cite an archive rather than the code, also cite the provenance
+  record the archive carries (manifests/provenance.json), which names the
+  policy and the provider releases that produced it.
+type: software
+authors:
+  - given-names: Giorgos
+    family-names: Ntagkounakis
+    email: giorgosntagkounakis@gmail.com
+    orcid: "https://orcid.org/0009-0009-2041-6939"
+version: 2.0.0
+date-released: "2026-09-27"
+license: MIT
+repository-code: "https://github.com/gntag/station-archive"
+abstract: >-
+  station-archive reconciles several overlapping public climate sources --
+  ECA&D, GHCN-Daily, NOAA GSOD and the Copernicus C3S land collection -- into a
+  single daily station-observation archive in which every accepted value has one
+  physical-station identity, one chosen source, a recorded reason for that
+  choice, and a traceable path back to the provider record it came from.
+
+  Rather than concatenating sources, it resolves station identity on series
+  evidence, rejects values the providers themselves document as
+  non-observations, selects one value per station-date-variable by a per-variable
+  source priority, and refuses to splice a source switch that fails a bias,
+  dispersion, wet-day-frequency and monthly-discontinuity test -- leaving the gap
+  open instead. Breakpoints are diagnosed by relative homogeneity testing and
+  flagged; no value is ever altered.
+keywords:
+  - climate data
+  - station observations
+  - data provenance
+  - duplicate detection
+  - homogeneity testing
+  - quality control
+references:
+  - type: article
+    title: >-
+      A homogeneity test applied to precipitation data
+    authors:
+      - family-names: Alexandersson
+        given-names: Hans
+    journal: "Journal of Climatology"
+    volume: 6
+    issue: 6
+    start: 661
+    end: 675
+    year: 1986
+    doi: "10.1002/joc.3370060607"
+    notes: "The SNHT statistic used by the breakpoint diagnosis."
+  - type: article
+    title: >-
+      blockCV: An R package for generating spatially or environmentally
+      separated folds for k-fold cross-validation of species distribution models
+    authors:
+      - family-names: Valavi
+        given-names: Roozbeh
+      - family-names: Elith
+        given-names: Jane
+      - family-names: Lahoz-Monfort
+        given-names: José J.
+      - family-names: Guillera-Arroita
+        given-names: Gurutzeta
+    journal: "Methods in Ecology and Evolution"
+    volume: 10
+    issue: 2
+    start: 225
+    end: 232
+    year: 2019
+    doi: "10.1111/2041-210X.13107"
+    notes: "The spatial-blocking convention used for the fold manifest."

@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "station-archive"
+dynamic = ["version"]
+description = "Build one reconciled daily station-observation archive from several overlapping public climate sources"
+readme = "README.md"
+requires-python = ">=3.10"          # the code uses PEP 604 built-in generics
+license = { file = "LICENSE" }
+authors = [
+    { name = "Giorgos Ntagkounakis", email = "giorgosntagkounakis@gmail.com" },
+]
+keywords = [
+    "climate",
+    "station-observations",
+    "data-provenance",
+    "homogeneity",
+    "GHCN-Daily",
+    "ECA&D",
+    "GSOD",
+    "Copernicus",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+# Lower bounds rather than pins: this is a library as well as a tool, and a
+# pinned scientific stack is unusable alongside anyone else's. This is the ONLY
+# declaration of what the package needs -- a second unpinned copy in a
+# requirements.txt drifted from it (it named a module that had moved out) and
+# was removed in 2.2.0.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=12.0",        # parquet: the consolidated gold table
+    "openpyxl>=3.1",        # xlsx: the merge-review workbook
+    "Pillow>=9.0",          # decoding DEM terrain tiles (station_archive/dem.py)
+    # scikit-learn was required here for fold_manifest.py, which moved to
+    # ungauged-downscaling in 2.0.0. Nothing in this package imports it.
+]
+
+[project.optional-dependencies]
+# Only needed to fetch the Copernicus C3S source; everything else runs without it.
+c3s = ["cdsapi>=0.6"]
+test = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "cdsapi>=0.6"]
+
+[project.scripts]
+station-archive = "station_archive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gntag/station-archive"
+Repository = "https://github.com/gntag/station-archive"
+Issues = "https://github.com/gntag/station-archive/issues"
+
+[tool.setuptools]
+packages = ["station_archive", "station_archive.sources"]
+# One version, in station_archive/__init__.py. Restating it here is how it
+# drifted from settings.USER_AGENT.
+
+[tool.setuptools.dynamic]
+version = { attr = "station_archive.__version__" }
+
+[tool.setuptools.package-data]
+station_archive = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No addopts on purpose: setting -q here doubles with a -q on the command line
+# and suppresses the pass/fail summary, which is the one line anyone wants.
+# Tests touch no network by design; a failure that needs one is a bug in the test.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

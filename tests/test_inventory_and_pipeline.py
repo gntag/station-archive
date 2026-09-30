@@ -13,9 +13,11 @@ from typing import Iterator, Sequence
 import pandas as pd
 import pytest
 
-from observations import config, inventory as inventory_module, manifests, net
-from observations.sources.base import StationSource
-from observations.types import (
+from station_archive import settings
+from station_archive import inventory as inventory_module, manifests, net
+from station_archive.policy import DEFAULT_POLICY
+from station_archive.sources.base import StationSource
+from station_archive.types import (
     Domain,
     DownloadRequest,
     RawObservation,
@@ -27,7 +29,7 @@ from observations.types import (
 
 @pytest.fixture(autouse=True)
 def archive(tmp_path, monkeypatch):
-    monkeypatch.setenv("STATION_ARCHIVE_ROOT", str(tmp_path / "archive"))
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path / "archive"))
     return tmp_path / "archive"
 
 
@@ -203,7 +205,7 @@ class FakeSource(StationSource):
 
 def test_end_to_end_discover_plan_fetch(archive):
     source = FakeSource()
-    inventory = source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005))
+    inventory = source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005))
     requests = source.plan(inventory)
     snapshots = source.fetch_all(requests, progress=False)
 
@@ -217,7 +219,7 @@ def test_end_to_end_discover_plan_fetch(archive):
 def test_rerun_skips_unchanged_files(archive):
     """Plan 1.5: skip a file only when its checksum matches."""
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     source.fetch_all(requests, progress=False)
 
     second = FakeSource()
@@ -229,7 +231,7 @@ def test_rerun_skips_unchanged_files(archive):
 def test_rerun_refetches_a_corrupted_file(archive):
     """A file that no longer matches its recorded checksum must be fetched again."""
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     snapshots = source.fetch_all(requests, progress=False)
     snapshots[0].path.write_bytes(b"corrupted")
 
@@ -241,7 +243,7 @@ def test_rerun_refetches_a_corrupted_file(archive):
 def test_rerun_reproduces_the_archive_checksum(archive):
     """Plan 1.8: unchanged snapshots must produce the identical checksum."""
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     source.fetch_all(requests, progress=False)
     first = manifests.archive_checksum("fake", "r1")
 
@@ -257,7 +259,7 @@ def test_requests_are_manifested_even_when_a_transfer_fails(archive):
             raise RuntimeError("provider unavailable")
 
     source = BrokenSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     snapshots = source.fetch_all(requests, progress=False)
 
     assert snapshots == []
@@ -267,7 +269,7 @@ def test_requests_are_manifested_even_when_a_transfer_fails(archive):
 
 def test_licence_is_recorded_for_every_run(archive):
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     source.fetch_all(requests, progress=False)
     releases = manifests.read_releases()
     assert releases[-1]["licence"] == "test licence"
@@ -286,13 +288,13 @@ def test_fetch_refuses_to_start_on_a_full_drive(archive, monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(1, 1, 1024))
 
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     with pytest.raises(RuntimeError, match="free"):
         source.fetch_all(requests, progress=False)
 
 
 def test_snapshots_are_written_under_source_and_release(archive):
     source = FakeSource()
-    requests = source.plan(source.discover(config.DOMAIN, config.VARIABLES, (1985, 2005)))
+    requests = source.plan(source.discover(DEFAULT_POLICY.domain, DEFAULT_POLICY.variables, (1985, 2005)))
     snapshots = source.fetch_all(requests, progress=False)
     assert snapshots[0].path.parent == archive / "raw" / "fake" / "r1"
