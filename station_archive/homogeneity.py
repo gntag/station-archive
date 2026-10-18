@@ -657,6 +657,50 @@ def build_flag_layer(
     return dedupe_flags(flagged[list(FLAG_LAYER_COLUMNS)].reset_index(drop=True))
 
 
+BREAKPOINT_TABLE_COLUMNS: tuple[str, ...] = (
+    "canonical_station_id",
+    "name",
+    "lat",
+    "lon",
+    "variable",
+    "breakpoint_date",
+    "transform",
+    "shift",
+    "shift_ratio",
+    "segment_before_mean",
+    "segment_after_mean",
+    "statistic",
+    "p_value",
+    "min_support_at_break",
+    "n_neighbors_used",
+)
+
+
+def flagged_breakpoint_table(report: pd.DataFrame, stations: pd.DataFrame) -> pd.DataFrame:
+    """
+    Every FDR-surviving break with the station's name and position, for a
+    person reading the list in a spreadsheet rather than joining it in code.
+
+    A listing only: the flags stay diagnostic, and nothing reads this back.
+    Sorted by station and date, so a cluster of same-dated breaks at
+    neighbouring stations -- one event seen several times, since this module
+    does not attribute a break across the network -- reads as a cluster.
+    """
+    if report.empty or "significant_fdr" not in report.columns:
+        return pd.DataFrame(columns=list(BREAKPOINT_TABLE_COLUMNS))
+    flagged = report[report["significant_fdr"].astype(bool)]
+    identity = stations[["canonical_station_id", "name", "lat", "lon"]]
+    table = flagged.merge(identity, on="canonical_station_id", how="left")
+    for column in BREAKPOINT_TABLE_COLUMNS:
+        if column not in table.columns:
+            table[column] = float("nan")
+    return (
+        table[list(BREAKPOINT_TABLE_COLUMNS)]
+        .sort_values(["canonical_station_id", "variable", "breakpoint_date"])
+        .reset_index(drop=True)
+    )
+
+
 def apply_flag_layer(values: pd.DataFrame, layer: pd.DataFrame) -> pd.DataFrame:
     """
     Layer the breakpoint flags onto a long-format observation table, so the

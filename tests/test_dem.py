@@ -289,3 +289,44 @@ def test_the_override_is_always_a_published_height_never_the_dem_reading(served_
     assert written != 100.0, "the DEM reading must never be written as the elevation"
     # the tile reads 100 m, so 46 is the nearer published value
     assert written == 46.0
+
+
+def test_computed_overrides_are_recomputed_against_the_current_groups(served_tiles):
+    """
+    An override the command computed belongs to the group it was computed for.
+    After a merge decision changes the groups it must be recomputed, or a stale
+    elevation survives for a station whose candidates have changed. Overrides
+    written by hand are still kept exactly as they are.
+    """
+    aliases = _aliases([
+        {"canonical_station_id": "c:1", "source": "ecad", "source_station_id": "1",
+         "elevation_m": 52.0},
+        {"canonical_station_id": "c:1", "source": "ghcnd", "source_station_id": "A",
+         "elevation_m": 165.0},
+        # c:2 was a disagreeing pair once; it has since been split
+        {"canonical_station_id": "c:2", "source": "ecad", "source_station_id": "2",
+         "elevation_m": 40.0},
+    ])
+    canonical = _canonical([
+        {"canonical_station_id": "c:1", "elevation_m": 52.0},
+        {"canonical_station_id": "c:2", "elevation_m": 40.0},
+    ])
+    existing = pd.DataFrame([
+        {"canonical_station_id": "c:1", "elevation_m": 999.0,
+         "reason": "elevation disagreement of 113 m between aliases; stale"},
+        {"canonical_station_id": "c:2", "elevation_m": 77.0,
+         "reason": "elevation disagreement of 30 m between aliases; stale"},
+        {"canonical_station_id": "c:3", "elevation_m": 164.0,
+         "reason": "metadata_conflicts.csv: decided by hand against CERRA orography"},
+    ])
+    out = dem.build_elevation_overrides(aliases, canonical, DEFAULT_POLICY,
+                                        existing=existing).set_index("canonical_station_id")
+    assert out.loc["c:1", "elevation_m"] == 52.0          # nearest to the 100 m DEM
+    assert "c:2" not in out.index                          # no longer disagrees
+    assert out.loc["c:3", "elevation_m"] == 164.0          # by hand: untouched
+
+
+def test_is_computed_override_recognises_only_the_commands_own_reason():
+    assert dem.is_computed_override("elevation disagreement of 12 m between aliases; ...")
+    assert not dem.is_computed_override("decided by hand")
+    assert not dem.is_computed_override(float("nan"))

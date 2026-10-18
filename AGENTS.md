@@ -17,10 +17,7 @@ the package and build an archive. Everything else is here, in this order:
 Those two files are the whole documentation set. If you read only one section
 before changing code, read **Invariants** — every one is load-bearing, several
 were learned from a measurement, and breaking one silently is the failure mode
-this repository is built to prevent. If you read only one
-thing before changing code, read the **Invariants** section below — every one of
-them is load-bearing, several were learned from a measurement, and breaking one
-silently is the failure mode this repository is built to prevent.
+this repository is built to prevent.
 
 ## What this is
 
@@ -30,9 +27,14 @@ over a layered archive on disk; each command reads what the previous one wrote
 and refuses to run if that is missing.
 
 ```
-discover → report → fetch → identity → review → consolidate → homogeneity
+discover → report → fetch → identity → climatology → review → consolidate
+                                                            → homogeneity
                                                             → provenance
 ```
+
+Once the archive exists, the quality-control loop is two commands around one
+sitting with the review workbook: `prepare` (identity → climatology → review)
+and `apply` (identity → dem → consolidate → homogeneity → provenance).
 
 `python -m station_archive.cli demo` runs the whole chain on synthetic data in
 seconds, with no network and no credentials. **Start there.** It exercises the
@@ -60,12 +62,15 @@ of what the pipeline does.
 | `review.py` | The workbook a human adjudicates in | Decide anything itself |
 | `consolidate.py` | Which value wins, and why | Interpolate or average |
 | `homogeneity.py` | Which series contain artificial breakpoints | Correct one |
+| `climatology.py` | Which source records sit implausibly far from an independent reference, and reading the reviewer's exclusion answers back | Remove a value; act on its own proposal |
 | `inventory.py` | The coverage report that answers "is this source worth fetching" | Decide identity; its clustering is an ESTIMATE |
 | `cli.py` | Stage orchestration and everything printed to a terminal | Hold a scientific rule of its own |
 | `demo.py` | A runnable synthetic end-to-end | Touch the network |
 
 Dependency direction is one-way: `sources/*` → `bronze` → `identity` →
-`consolidate` → `homogeneity`. `policy` and `settings` are read by everything
+`consolidate` → `homogeneity`, with `climatology` reading `identity` and
+`consolidate` and read only by `cli` (consolidation takes the reviewer's
+exclusions as plain data, never by importing the screen). `policy` and `settings` are read by everything
 and depend on nothing except `types` and the registry — with two deliberate,
 function-local exceptions, both deferred imports so no module-scope cycle
 exists: `policy.__post_init__` reads `qc.gated_variables()` to refuse a
@@ -167,6 +172,23 @@ Break any of these and the archive stops meaning what it claims. Each is tested.
   Benjamini-Hochberg — at 0.0 a break passes BH at any rank. On this archive the
   flagged set is 481 either way; on a report where few series carry a break the
   two answers differ.
+- **The climatology screen compares a record with the reference on the
+  record's own days, never mean against mean.** A record's sampling can
+  manufacture a departure by itself: GSOD reports a gust only on gusty days (a
+  median 10% of the days a GSOD station reports wind, on which the reference
+  gust runs 1.45x its all-days mean). Compared mean against mean, a Sicilian
+  network reporting every day looked half as gusty as its GSOD neighbours;
+  on shared days it is 0.86 of them, and against the reference a normal 0.94.
+  `reporting_fraction` and `sampling_note` are on every row so this stays
+  visible.
+- **A blank `DECISION_exclude` keeps the record, even on a row the screen
+  recommends excluding.** The screen proposes; only an explicit `yes` removes a
+  record from selection. `apply` prints how many proposals were left blank, so
+  "nothing was excluded" is never mistaken for "nothing was wrong".
+- **The screen judges source records, not canonical stations.** That is what
+  lets merges and exclusions be answered in one sitting -- an exclusion's
+  subject does not change when a merge does -- and what lets an excluded
+  record hand its days to the next-ranked source of the same station.
 - **`check_gross_range` drops NaN for a variable it has no bounds for, but
   range-judges nothing.** The two rules are separate on purpose: the NaN guard
   is unconditional because the docstring promises it, while inventing a
@@ -438,7 +460,9 @@ stays missing), average two sources, or rewrite bronze.
 **Nothing is deleted.** Every candidate value that existed but was not chosen
 goes to `non_selected_candidates/` with its reason — either `outranked: date
 already covered by a higher-priority source`, or the exact compatibility failure
-that refused it. In this archive that audit table holds 3,345,601 values.
+that refused it, or `reviewer exclusion: …` for a record a reviewer excluded
+after the climatology screen. In this archive that audit table holds 3,408,503
+values.
 
 Every selected row carries `selected_source`, `source_station_id`,
 `source_rank`, `selection_reason`, `is_fallback` and a `source_record_id` that
@@ -495,16 +519,44 @@ table and marks which side of a break each observation falls on.
 
 ### The human decisions, and where they live
 
-Two stages of this pipeline deliberately stop and ask a person, and both keep
-their answers in `review/` so that no reviewed decision is buried in a
+The pipeline stops and asks a person once, between `prepare` and `apply`, and
+keeps every answer in `review/` so that no reviewed decision is buried in a
 conversation, a commit message or a script:
 
 | File | Decides | Read back by |
 |---|---|---|
 | `station_merge_review.xlsx` | whether two source records are one station, in `DECISION_merge` | `identity --decisions <path>` |
+| `station_merge_review.xlsx`, `Series` sheet | whether a source record is excluded from selection for one variable, in `DECISION_exclude` | `consolidate --decisions <path>` |
 | `elevation_overrides.csv` | which elevation is correct where two archives disagree | written by `station-archive dem`; applied by the consumer at read time |
 
-The workbook has five sheets. `Review` holds pairs the rules **refused**, within
+**Why one sitting is possible.** Merges and exclusions do not depend on each
+other: the climatology screen judges each source record against a reference
+sampled at its own place, so its verdict does not move when a merge does, and
+an exclusion never feeds back into the merge evidence -- a record carrying a
++5 degC offset still proves whether two archives hold one instrument. Elevation
+asks nothing: `dem` applies the rule (coordinates from the record with the most
+observations, the published elevation nearest the DEM) after the merges, to the
+groups that then exist. Breakpoints are the one thing that cannot be in the same
+sitting, because they can only be found on the final series; they stay flags.
+
+**The `Series` sheet** lists records the screen put in a tier, strongest first:
+`EXCLUDE` above 4 robust SDs from the median departure of that variable,
+`REVIEW` between 3 and 4. Each row carries the departure, the matched-day means,
+the reporting fraction, and neighbour context -- how many stations within
+100 km, how they depart, how many depart the same way. A summit with no
+neighbours, a station its neighbours disagree with, and a whole network offset
+together read differently there. `Series_decisions` is its ledger, for the same
+reason `Decisions` exists: an answer whose row is no longer offered still
+governs consolidation.
+
+It opens on `Start_here`, which lists every tab, what it shows, which column the
+reviewer fills and what to write there (`review.instructions_sheet`). It is
+qualitative on purpose, so it needs no analysis to rebuild and never goes
+stale against the numbers, and it has no decision column, so nothing is read
+from it.
+
+Beyond `Start_here` and `Summary`, the merge decisions use five sheets.
+`Review` holds pairs the rules **refused**, within
 3 km, for you to overturn. `Already_merged` holds the opposite and is the newer
 of the two: every pair the rules merged **without being asked**, widest and
 least-agreeing first. A refusal leaves two stations that were always two; a
@@ -512,24 +564,31 @@ wrong merge fuses two sites and puts one of them in the other's series and
 folds, so it is the more consequential direction. Writing `no` there splits the
 pair. `Beyond_radius`, `Never_merge_rule` and `Metadata_conflicts` are context.
 
-A sixth sheet, `Decisions`, is the durable ledger: every decision ever made,
+A further sheet, `Decisions`, is the durable ledger: every decision ever made,
 with `still_offered` saying whether the pair still appears elsewhere in the
 workbook. It exists because a `yes` merges its pair, so the next rebuild
 presents it nowhere — not in `Review`, which holds only refusals, and not in
 `Already_merged`, which excludes reviewer-decided pairs. Without the ledger a
 rebuild dropped those decisions and the merges they authorised were lost on the
-next run. 145 of the 178 decisions in this archive are in exactly that
-position.
+next run. In this archive 467 merge decisions are recorded: 146 merge a pair
+the rules refused, 1 splits a pair the rules merged, and the rest confirm what
+the rules concluded. Every reviewer-merged pair and every confirmed automatic
+merge is in exactly that position; a confirmed refusal stays on `Review`.
 
 Every sheet that shows a decision column is read back, and a rebuild carries
 forward what was already decided — neither was always true, and a column
 nothing reads is worse than no column at all.
 
-Both are inputs, not outputs — the pipeline reads them and never writes to
-them. Neither is applied silently: a merge decision is recorded in
+Both are inputs, not outputs. The pipeline rebuilds them -- `review` writes
+the workbook afresh, `dem` recomputes the rows it computed itself -- but never
+loses an answer a person wrote: every decision is carried into the rebuilt
+workbook and its ledger, and a hand-written override is kept as it stands.
+Neither is applied silently: a merge decision is recorded in
 `duplicate_evidence.csv` as `reviewer decision: …` alongside what the automated
-gate had concluded, and an elevation override is applied at **read time**,
-leaving the consolidated archive reproducible from its source snapshots.
+gate had concluded, a series exclusion is recorded in `non_selected_candidates/`
+and `qc_rejections.csv`, and an elevation override is applied at **read time**.
+The consolidated archive is therefore reproducible from its source snapshots
+together with the review workbook, not from the snapshots alone.
 
 `elevation_overrides.csv` has columns `canonical_station_id`, `elevation_m` and
 `reason`, one row per correction, and the reason is expected to carry the
@@ -537,8 +596,12 @@ evidence. `station-archive dem` fills it in for any station whose aliases
 disagree by more than 10 m, reading AWS Terrain Tiles at the station's position
 and choosing **the published elevation nearest to the DEM** — it never writes
 the DEM's own reading, because a DEM pixel is not a height any provider
-asserted. Rows already in the file are kept untouched, so a correction you made
-by hand outranks one the command would compute. An example of the hand-made
+asserted. Rows written by hand are kept untouched, so a correction you made
+by hand outranks one the command would compute. Rows the command wrote itself
+(their reason begins `elevation disagreement of`) are recomputed on every run,
+because each was computed for its station's group at the time, and a merge
+decision applied since can change the candidates or leave nothing to disagree
+about. An example of the hand-made
 kind reads, in full:
 
 > `metadata_conflicts.csv`: verified-identical series (dist=0 km, tasmax r=1.0)
@@ -648,8 +711,11 @@ GHCN-D 160, C3S 118.
 | Coincident coordinates + series | 183 |
 | Near coordinates + series | 94 |
 
-Of those 433, **288 were made by the rules alone** and 145 came from a reviewer
-decision. The widest separation inside any canonical station is 5.5 km; before
+Of those 433, **287 were made by the rules alone** and 146 came from a reviewer
+decision; one further pair the rules had merged (`ecad:000174` /
+`gsod:16320099999`, 2.98 km) was split by a reviewer on `Already_merged`. All
+288 merges the rules had made were reviewed there: 287 confirmed, that one
+split. The widest separation inside any canonical station is 5.5 km; before
 the identifier gate it was 327 km.
 
 139 aliases carry `duplicate_risk`, 68 of those because the never-merge rule
@@ -658,28 +724,87 @@ value-agreement review; 14 metadata conflicts are queued. 398 aliases sit in a
 group that was formed transitively rather than by all-pairs comparison, which is
 flagged rather than silently trusted.
 
-**Consolidation** — 9,688,780 accepted daily values across 1,206 stations, of
-which 204,099 (2.11 %) are same-station fallbacks. Selected days by variable
+**Consolidation** — 9,503,860 accepted daily values across 1,203 stations, of
+which 202,522 (2.13 %) are same-station fallbacks. Selected days by variable
 and source:
 
 | Variable | ecad | ghcnd | gsod |
 |---|---|---|---|
-| `tas` | 1,090,111 | — | 519,470 |
-| `tasmin` | 1,167,583 | 197,924 | 404,631 |
-| `tasmax` | 1,126,193 | 218,616 | 400,938 |
-| `pr` | 1,866,182 | 197,629 | 228,402 |
+| `tas` | 1,077,571 | — | 511,016 |
+| `tasmin` | 1,155,713 | 192,328 | 404,056 |
+| `tasmax` | 1,114,417 | 218,616 | 399,724 |
+| `pr` | 1,771,959 | 201,031 | 237,936 |
 | `hurs` | 246,749 | — | — |
-| `sfcWind` | 1,600,749 | 2,123 | 299,312 |
-| `gust` | 37,218 | 2,485 | 82,465 |
+| `sfcWind` | 1,551,401 | 2,123 | 299,363 |
+| `gust` | 37,218 | 2,485 | 80,154 |
+
+Before the climatology exclusions the table held 9,688,780 values across 1,206
+stations (204,099 fallbacks). The difference is accounted for exactly: the
+excluded records had supplied 200,834 selected values; on 15,747 of those days
+another source of the same station took over (15,061 `pr` -- 10,843 from GSOD,
+4,218 from GHCN-D -- 638 `tasmin`, 48 `sfcWind`), the other 185,087 days are
+now missing, and promoting a lower-ranked source added 167 days its record had
+that the excluded one lacked. No value from a record that was not excluded
+moved or changed.
 
 **Quality control** — 240,704 GSOD precipitation values rejected as
-non-observations (230,846 on flag `I`, 9,858 on flag `H`).
+non-observations (230,846 on flag `I`, 9,858 on flag `H`), and 246,989 values
+excluded by reviewer decision after the climatology screen (`pr` 113,487,
+`sfcWind` 63,918, `tasmin` 25,984, `tas` 20,994, `tasmax` 20,295, `gust` 2,311).
+The second figure is larger than the 200,834 selected values removed because it
+also counts excluded copies that were already losing to a higher-ranked source.
 
-**Fallbacks** — 269 source switches tested, **152 refused** and their gaps left
-open: 77 for insufficient overlap, 43 on monthly discontinuity, 26 on bias, 3
+**Climatology screen** — 4,973 source record x variable series reached, 3,002
+tested against CERRA on matched days (1,778 had under 365 matched days, many of
+them ECA&D records whose provider file begins on 2005-12-31; 193 had no
+reference point). 108 were put in a tier, across 67 stations: 62 proposed for
+exclusion and 46 for review.
+
+| Variable | proposed for exclusion | review |
+|---|---|---|
+| `pr` | 42 | 4 |
+| `tasmax` | 9 | 13 |
+| `tasmin` | 2 | 13 |
+| `tas` | 3 | 6 |
+| `sfcWind` | 6 | 6 |
+| `gust` | 0 | 4 |
+| `hurs` | 0 | 0 |
+
+The reviewer excluded 78 (61 of the 62 proposals, 17 of the 46 review rows),
+which removed 51 station x variable series from the gold table entirely. What
+the screen found:
+
+* **ECA&D and GSOD precipitation that is exactly zero** on 400-6,600 matched days at
+  Greek, Bulgarian and Turkish airports (Elefsis, Kos, Santorini, Chios,
+  Anchialos, Sofia, Corlu ...). Every archive delivers the same zeros, so these
+  stations now have no precipitation series rather than a false one.
+* **ECA&D precipitation 4-20x too small** at Monte Cimone, Vigna di Valle,
+  Monte S. Angelo, Capo Bellavista and Bracciano, with the same wet-day
+  fraction as the GHCN-D and GSOD records they outranked. GHCN-D and GSOD now
+  supply those stations where their own records pass.
+* **A Lazio block of ECA&D stations reading +5 to +6 degC in `tasmax`** after
+  the elevation adjustment (Piglio, Alatri, Licenza, Arpino, Castel di Tora,
+  Agosta), each with 10-12 neighbours flagged the same way.
+* **Gran Sasso (GSOD) temperatures +6 to +12.5 degC**, with a 900 m gap between
+  the station's stated elevation and the reference orography.
+* **Summits and capes** (Cimone, Cherni Vrah, Botev, Mourgash, Terminillo,
+  Zavizan): wind 3x the reference, temperatures below it. Probably real sites
+  the 5.5 km reference cannot resolve; excluded here by reviewer decision.
+
+What it did not find: the Sicilian agrometeorological network's gusts. Its
+records sat 6-10 m/s against GSOD neighbours at about 15, which looked like half;
+but GSOD reports a gust on a median 10% of days, the gusty ones, on which the
+reference gust runs 1.45x its all-days mean. On shared days the network is 0.86
+of its GSOD neighbours, and against the reference a normal 0.94. 27 of its 29
+gust records are `ok`; Patti and Palermo are in review and were kept.
+
+**Fallbacks** — 263 source switches tested, **146 refused** and their gaps left
+open: 77 for insufficient overlap, 43 on monthly discontinuity, 20 on bias, 3
 because no calendar month held enough shared days for the discontinuity test to
-run at all, 3 on dispersion. 3,223,583 non-selected candidate values retained
-for audit.
+run at all, 3 on dispersion. All 41 switches between two GSOD records of one
+station are refused, almost always for want of overlap: a GSOD station that
+changed identifier has none by construction. 3,408,503 non-selected candidate
+values retained for audit.
 
 The monthly-discontinuity count fell from 48 with the addition of
 `FallbackPolicy.min_days_per_month` (see its comment in `policy.py`): five of those
@@ -695,21 +820,26 @@ arcminute (±900 m on the ground), so the gap is evidence about the coordinate
 rather than the height. One override was decided by hand before the command
 existed and is preserved as it stands.
 
-**Homogeneity** — 2,143 station-variable series reached, of which 1,240 were
-testable (353 had no usable neighbour, 268 too few neighbours, 263 were too
+**Homogeneity** — 2,100 station-variable series reached, of which 1,225 were
+testable (331 had no usable neighbour, 265 too few neighbours, 260 were too
 short, 13 had no variance, and 6 had neighbours but no window those neighbours
-could attribute a break in). **482 flags survive the FDR correction**, across
-280 stations: 122 `tasmin`, 116 `sfcWind`, 105 `tas`, 100 `tasmax`, 31 `pr`,
-8 `hurs`, 0 `gust`.
+could attribute a break in). **478 flags survive the FDR correction**, across
+278 stations: 123 `tasmin`, 116 `sfcWind`, 102 `tas`, 98 `tasmax`, 31 `pr`,
+8 `hurs`, 0 `gust`. They are listed with station name, position, date and shift
+in `consolidated/homogeneity_breakpoints.xlsx`. Before the climatology
+exclusions the report reached 2,143 series and flagged 482; the excluded series
+are no longer there to be tested, and removing them also changes the neighbour
+references of the stations around them.
 
 The smallest p-value in the report is 1/501, not 0: a permutation test with 500
 shuffles cannot resolve anything finer, so `(1 + count) / (1 + n)` is what is
-reported. The flag count is 482 either way on this archive — the one series that
-changed verdict did so because a *neighbour* gained 4,700 recovered fallback
-days, which moved its reference series.
+reported. On the archive before the climatology exclusions the flag count was
+482 either way — the one series that changed verdict did so because a
+*neighbour* gained 4,700 recovered fallback days, which moved its reference
+series.
 
 Every flag carries `min_support_at_break`, the number of neighbours standing
-behind the month the break was found in, and it is at least two on all 482.
+behind the month the break was found in, and it is at least two on all 478.
 That column exists because the two-neighbour rule used to be checked against a
 count over the whole series while the search ran over months whose support
 could be one. The `homogeneity.py` docstrings explain how that fix and the
@@ -732,6 +862,9 @@ document (`RESEARCH_PLAN_AND_DESIGN.md`), which is not part of this repository;
 
 Known gaps, stated rather than implied:
 
+- The climatology screen compares one long-term mean per record with the
+  reference. A record that is right in most years and wrong in a few, or whose
+  day-to-day variability or timing is wrong while its mean is right, passes it.
 - The elevation override table (`review/elevation_overrides.csv`) carries 25
   corrections, 24 of them computed by `station-archive dem` and one made by hand
   against CERRA orography before that command existed. The other conflicts in
@@ -964,8 +1097,36 @@ or not they passed, so a refusal can be reviewed rather than merely obeyed.
 | Column | Meaning |
 |---|---|
 | `source`, `variable` | What was rejected. |
-| `reason` | Why, quoting the provider's documentation where it is a provider flag. |
+| `reason` | Why, quoting the provider's documentation where it is a provider flag. `reviewer exclusion (climatology screen)` for values removed by a `DECISION_exclude` answer. |
 | `n_values` | Count. |
+
+### `consolidated/climatology_screen.csv`
+
+One row per selectable source record x variable reached. Diagnostic only; the
+review workbook's `Series` sheet is built from it.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `alias`, `canonical_station_id`, `source`, `source_station_id`, `name`, `lat`, `lon` | | The record and the station it currently belongs to. |
+| `variable` | str | Canonical variable. |
+| `status` | str | `tested`, or why not: `no_reference`, `too_few_matched_days` (< 365), `undefined_departure`. **Read this first.** |
+| `reference_key` | str | The reference point used: the record's own key, or another member of its station's group. |
+| `n_matched_days` | int | Days both the record and the reference have. |
+| `station_mean`, `reference_mean` | float | Means over those days only, canonical units. |
+| `elevation_adjustment` | float | Temperature only: the reference moved to the station's height at 6.5 K/km. Diagnostic; no value is changed by it. |
+| `departure` | float | Log ratio for `pr`, `sfcWind`, `gust` (`-inf` when the record's mean is zero); difference in canonical units otherwise. |
+| `departure_units` | str | `log ratio`, or the variable's unit. |
+| `robust_z` | float | (departure - median) / (1.4826 x MAD) over every tested record of the variable. |
+| `tier` | str | `propose_exclusion` (abs z > 4), `review` (3 < abs z <= 4), `ok`. |
+| `reporting_fraction` | float | Days with this variable / days the record reports anything. |
+| `sampling_note` | str | Set where the provider's convention biases the sample -- GSOD gust. |
+| `n_neighbors`, `neighbor_median_departure`, `departure_vs_neighbors`, `n_neighbors_same_direction` | | Other stations within 100 km, counted once each: how they depart, and how many are flagged the same way. |
+
+### `consolidated/homogeneity_breakpoints.xlsx`
+
+`Breakpoints`: every FDR-surviving break with station name, position, date,
+transform, shift and support. `All_series`: the full report. A listing for a
+person; nothing reads it back.
 
 ### `consolidated/source_contribution.csv`
 
@@ -988,15 +1149,17 @@ Accepted-day counts, never percentages, so a sparse year cannot look complete.
 | `manifests/source_releases.jsonl` | One line per acquisition: source, provider release, retrieval time, licence. |
 | `manifests/<source>/<release>/requests.jsonl` | Every planned request. Credential-looking payload keys are redacted. |
 | `manifests/<source>/<release>/snapshots.jsonl` | Every file fetched, with sha256 and byte count. Bronze is located from here, not by walking directories. |
-| `manifests/provenance.json` | Policy, library versions, platform and per-source archive checksums for one build. |
+| `manifests/provenance.json` | Policy, library versions, platform and per-source archive checksums for one build, plus `climatology_reference`: the reference files the climatology screen ran on and the screen it produced, each by file name, size and sha256 (never a local path), or `not used`. |
+| `manifests/climatology_reference.json` | That reference record, written by `climatology` at the moment it reads the files; `provenance` copies it. |
 
 ### `review/` — inputs, not outputs
 
-The pipeline reads these and never writes to them.
+The pipeline reads these. It rebuilds them, but never loses an answer a person
+wrote in them.
 
 | Path | Decides |
 |---|---|
-| `station_merge_review.xlsx` | Whether two source records are one station, in `DECISION_merge` (`yes`/`no`). Read back from every sheet that shows the column, including `Already_merged` and `Beyond_radius`. |
+| `station_merge_review.xlsx` | Whether two source records are one station, in `DECISION_merge` (`yes`/`no`). Read back from every sheet that shows the column, including `Already_merged` and `Beyond_radius`. Also whether a source record is excluded from selection, in the `Series` sheet's `DECISION_exclude` (`yes`/`no`; blank keeps it), with `Series_decisions` as the ledger. |
 | `elevation_overrides.csv` | Which elevation is right where two archives disagree. Columns `canonical_station_id`, `elevation_m`, `reason`. Applied by the consumer **at read time**, so the archive stays reproducible from its snapshots. |
 
 A large DEM-to-winner gap in a `reason` is evidence about the **coordinate**,

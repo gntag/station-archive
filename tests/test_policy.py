@@ -347,3 +347,57 @@ def test_demo_runs_the_whole_chain(tmp_path, capsys):
     assert "merged: YES" in out
     assert (tmp_path / "raw" / "ecad").exists()
     assert (tmp_path / "inventory" / "ecad_inventory.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# The climatology reference: an input that changes the archive, so provenance
+# must say which one was used
+# ---------------------------------------------------------------------------
+
+def test_reference_record_identifies_each_file_by_checksum(tmp_path, monkeypatch):
+    import hashlib
+
+    from station_archive import manifests
+
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path))
+    reference = tmp_path / "cerra.parquet"
+    reference.write_bytes(b"reference bytes")
+    screen = tmp_path / "screen.csv"
+    screen.write_bytes(b"alias,variable\n")
+    record = manifests.record_reference(
+        {"reference": reference, "reference_static": None, "screen": screen}
+    )
+    assert record["reference"]["file"] == "cerra.parquet"
+    assert record["reference"]["bytes"] == len(b"reference bytes")
+    assert record["reference"]["sha256"] == hashlib.sha256(b"reference bytes").hexdigest()
+    assert record["reference_static"] == {"status": "not given"}
+    assert record["screen"]["sha256"] == hashlib.sha256(b"alias,variable\n").hexdigest()
+    # written where provenance will find it, and read back unchanged
+    assert manifests.read_reference_record() == record
+
+
+def test_provenance_carries_the_reference_record(tmp_path, monkeypatch):
+    from station_archive import manifests
+
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path))
+    assert manifests.build_provenance(DEFAULT_POLICY, [])["climatology_reference"] == {
+        "status": "not used"
+    }
+    reference = tmp_path / "cerra.parquet"
+    reference.write_bytes(b"x")
+    manifests.record_reference({"reference": reference})
+    record = manifests.build_provenance(DEFAULT_POLICY, [])
+    assert record["climatology_reference"]["reference"]["file"] == "cerra.parquet"
+    json.dumps(record)
+
+
+def test_reference_record_never_stores_an_absolute_path(tmp_path, monkeypatch):
+    """A provenance record is shared; a local path in it says nothing to anyone else."""
+    from station_archive import manifests
+
+    monkeypatch.setenv(settings.ARCHIVE_ROOT_ENV_VAR, str(tmp_path))
+    reference = tmp_path / "deep" / "cerra.parquet"
+    reference.parent.mkdir()
+    reference.write_bytes(b"x")
+    text = json.dumps(manifests.record_reference({"reference": reference}))
+    assert str(tmp_path) not in text and str(tmp_path).replace("\\", "/") not in text

@@ -236,6 +236,16 @@ def adjudicate(
     return key, abs(usable[key] - dem_elevation)
 
 
+# Every reason this module writes starts with these words, which is how a row
+# it computed is told apart from one a person wrote.
+COMPUTED_REASON_PREFIX = "elevation disagreement of "
+
+
+def is_computed_override(reason: object) -> bool:
+    """Whether an override row was written by build_elevation_overrides."""
+    return isinstance(reason, str) and reason.startswith(COMPUTED_REASON_PREFIX)
+
+
 def build_elevation_overrides(
     aliases: pd.DataFrame,
     canonical: pd.DataFrame,
@@ -251,10 +261,16 @@ def build_elevation_overrides(
     the station's canonical position, and the alias elevation nearest to it
     becomes the override.
 
-    Rows already present in 'existing' are carried through untouched: a
+    Rows a person wrote in 'existing' are carried through untouched: a
     correction a person reviewed outranks one this function would compute, and
     silently replacing it would discard the human decision this whole workbook
     machinery exists to capture.
+
+    Rows this function wrote on an earlier run are recomputed instead. Each
+    was computed for the group its station had then, and a merge decision
+    applied since can add a candidate elevation, remove one, or leave nothing
+    to disagree about; kept as they were, they would be applied at read time
+    to a station they no longer describe.
     """
     if aliases.empty or canonical.empty:
         return pd.DataFrame(columns=["canonical_station_id", "elevation_m", "reason"])
@@ -263,6 +279,10 @@ def build_elevation_overrides(
         existing.copy() if existing is not None and not existing.empty
         else pd.DataFrame(columns=["canonical_station_id", "elevation_m", "reason"])
     )
+    if not reviewed.empty:
+        reviewed = reviewed[
+            ~reviewed["reason"].map(is_computed_override)
+        ].reset_index(drop=True)
     already = set(reviewed.get("canonical_station_id", []))
 
     working = aliases.copy()
@@ -296,7 +316,7 @@ def build_elevation_overrides(
                 "canonical_station_id": canonical_id,
                 "elevation_m": float(candidates[winner]),
                 "reason": (
-                    f"elevation disagreement of {spread:.0f} m between aliases; "
+                    f"{COMPUTED_REASON_PREFIX}{spread:.0f} m between aliases; "
                     f"AWS Terrain Tiles (terrarium, zoom {policy.dem.zoom}) reads "
                     f"{reading:.2f} m at ({station['lat']:.4f}, {station['lon']:.4f}), "
                     f"nearest published value is {winner} at "

@@ -491,6 +491,226 @@ def carry_forward_decisions(
     return out
 
 
+# ---------------------------------------------------------------------------
+# The Series sheets: the climatology screen's proposals, in the same workbook
+# ---------------------------------------------------------------------------
+# One workbook, one pass. A record's exclusion does not depend on any merge
+# decision -- the screen judges source records, not merged stations -- so both
+# kinds of question can be answered at the same sitting.
+
+SERIES_SHEET_COLUMNS: tuple[str, ...] = (
+    "alias", "canonical_station_id", "name", "lat", "lon", "variable",
+    "RECOMMENDATION", "robust_z", "departure", "departure_units",
+    "station_mean", "reference_mean", "n_matched_days", "reporting_fraction",
+    "sampling_note", "n_neighbors", "neighbor_median_departure",
+    "departure_vs_neighbors", "n_neighbors_same_direction", "reference_key",
+)
+SERIES_DECISION_COLUMNS: tuple[str, ...] = ("DECISION_exclude", "DECISION_note")
+SERIES_LEDGER_COLUMNS: tuple[str, ...] = (
+    "alias", "variable", "DECISION_exclude", "DECISION_note", "still_offered",
+)
+_RECOMMENDATION = {"propose_exclusion": "EXCLUDE", "review": "REVIEW"}
+
+
+def series_sheet(screen: pd.DataFrame) -> pd.DataFrame:
+    """
+    The records the screen proposes for exclusion or review, strongest first.
+
+    Recommendations only: the decision column is blank, and a blank keeps the
+    record. Nothing leaves the gold table without a reviewer's 'yes'.
+    """
+    columns = [*SERIES_SHEET_COLUMNS, *SERIES_DECISION_COLUMNS]
+    if screen.empty or "tier" not in screen.columns:
+        return pd.DataFrame(columns=columns)
+    flagged = screen[screen["tier"].isin(list(_RECOMMENDATION))].copy()
+    flagged["RECOMMENDATION"] = flagged["tier"].map(_RECOMMENDATION)
+    for column in SERIES_DECISION_COLUMNS:
+        flagged[column] = ""
+    for column in SERIES_SHEET_COLUMNS:
+        if column not in flagged.columns:
+            flagged[column] = float("nan")
+    flagged["_strength"] = flagged["robust_z"].abs()
+    flagged = flagged.sort_values(
+        ["_strength", "variable", "alias"], ascending=[False, True, True]
+    )
+    return flagged[columns].reset_index(drop=True)
+
+
+def carry_forward_exclusions(
+    sheet: pd.DataFrame,
+    previous: dict[tuple[str, str], tuple[str, str]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Re-apply exclusion decisions already made, and keep every one in a ledger.
+
+    The same reasoning as carry_forward_decisions: a rebuild must not cost an
+    answer, and an answer whose row is no longer offered (the screen stopped
+    flagging it, or the record now passes) still governs consolidation, so it
+    needs somewhere durable to live -- the Series_decisions sheet.
+    """
+    ledger_empty = pd.DataFrame(columns=list(SERIES_LEDGER_COLUMNS))
+    if not previous:
+        return sheet, ledger_empty
+    working = sheet.copy()
+    offered = set(zip(working["alias"], working["variable"]))
+    answers = [previous.get((a, v)) for a, v in zip(working["alias"], working["variable"])]
+    working["DECISION_exclude"] = [
+        answer[0] if answer else current
+        for answer, current in zip(answers, working["DECISION_exclude"])
+    ]
+    working["DECISION_note"] = [
+        answer[1] if answer else current
+        for answer, current in zip(answers, working["DECISION_note"])
+    ]
+    ledger = pd.DataFrame(
+        [
+            {
+                "alias": alias,
+                "variable": variable,
+                "DECISION_exclude": answer,
+                "DECISION_note": note,
+                "still_offered": (alias, variable) in offered,
+            }
+            for (alias, variable), (answer, note) in sorted(previous.items())
+        ],
+        columns=list(SERIES_LEDGER_COLUMNS),
+    )
+    return working, ledger
+
+
+# ---------------------------------------------------------------------------
+# The Start_here tab: what each tab is and what the reviewer writes where
+# ---------------------------------------------------------------------------
+# Qualitative only, so it never goes stale against the numbers on the other
+# tabs and needs no analysis to rebuild. It carries no DECISION_ column of its
+# own: nothing is read back from it.
+
+INSTRUCTIONS_SHEET = "Start_here"
+
+# Every tab the review command writes, in the order it writes them.
+WORKBOOK_TABS: tuple[str, ...] = (
+    INSTRUCTIONS_SHEET,
+    "Summary",
+    "Review",
+    "Already_merged",
+    "Series",
+    "Per_variable",
+    "Metadata_conflicts",
+    "Beyond_radius",
+    "Never_merge_rule",
+    "Decisions",
+    "Series_decisions",
+)
+
+_ANSWERS = (
+    "yes / no. Capitals and spaces do not matter. A blank cell is no decision. "
+    "Anything else (e.g. 'maybe') is ignored as undecided."
+)
+
+_INSTRUCTIONS: tuple[dict[str, str], ...] = (
+    {"tab": "HOW THIS WORKS",
+     "what it shows": "One workbook holds every decision the pipeline needs from a "
+                      "person: which records are one station (merges) and which "
+                      "records are excluded for a variable (series exclusions).",
+     "what you do": "1. Fill in the decision columns on the tabs marked 'FILL IN'. "
+                    "2. Save the file and close Excel. "
+                    "3. Run 'station-archive apply'.",
+     "column to fill": "", "write": ""},
+    {"tab": "HOW THIS WORKS",
+     "what it shows": "Rebuilding this workbook never loses an answer: every "
+                      "decision is carried into the new copy and kept in the "
+                      "ledger tabs.",
+     "what you do": "Answer each row once. A row you answered will not be asked "
+                    "again unless its evidence changes.",
+     "column to fill": "", "write": ""},
+    {"tab": INSTRUCTIONS_SHEET,
+     "what it shows": "This page.",
+     "what you do": "Read only.",
+     "column to fill": "", "write": ""},
+    {"tab": "Summary",
+     "what it shows": "How many rows each tab holds and what the recommendations mean.",
+     "what you do": "Read only.",
+     "column to fill": "", "write": ""},
+    {"tab": "Review",
+     "what it shows": "FILL IN. Pairs of records within 3 km that the rules REFUSED "
+                      "to merge, with the evidence and a recommendation "
+                      "(LIKELY MERGE ... LIKELY DISTINCT).",
+     "what you do": "Decide whether the two records are the same physical station.",
+     "column to fill": "DECISION_merge (and optionally DECISION_note)",
+     "write": "yes = merge them into one station. no = keep them separate. "
+              "Blank = the rules stand (separate). " + _ANSWERS},
+    {"tab": "Already_merged",
+     "what it shows": "FILL IN. Pairs the rules MERGED on their own, widest and "
+                      "least-agreeing first. A wrong merge puts two sites into one "
+                      "series, so this is the more consequential direction.",
+     "what you do": "Confirm or split each merge.",
+     "column to fill": "DECISION_merge (and optionally DECISION_note)",
+     "write": "yes = confirm the merge. no = split into two stations. "
+              "Blank = the merge stands. " + _ANSWERS},
+    {"tab": "Series",
+     "what it shows": "FILL IN. Source records whose long-term mean, on the days "
+                      "they share with CERRA, sits far from CERRA compared with "
+                      "every other record of that variable. RECOMMENDATION "
+                      "EXCLUDE = more than 4 robust SDs; REVIEW = 3 to 4. "
+                      "Neighbour columns show how stations within 100 km compare: "
+                      "many flagged the same way suggests a network problem, no "
+                      "neighbours suggests a site CERRA cannot resolve (summit, "
+                      "cape, valley).",
+     "what you do": "Decide whether that record's values for that one variable are "
+                    "believable. Compare station_mean with reference_mean, and "
+                    "read the neighbour columns.",
+     "column to fill": "DECISION_exclude (and optionally DECISION_note)",
+     "write": "yes = exclude this record for this variable; the next-ranked "
+              "source of the same station takes over, or the days stay empty. "
+              "no = keep it. Blank = keep it (nothing is excluded without a yes). "
+              "Your note is written into the audit table as the reason. " + _ANSWERS},
+    {"tab": "Per_variable",
+     "what it shows": "Every variable compared side by side for each pair on the "
+                      "Review tab.",
+     "what you do": "Read only: evidence for the Review tab.",
+     "column to fill": "", "write": ""},
+    {"tab": "Metadata_conflicts",
+     "what it shows": "Merged pairs whose observations are identical but whose "
+                      "archives disagree on coordinates or elevation, and which "
+                      "values the archive uses.",
+     "what you do": "Read only. Elevations are settled by the DEM rule during "
+                    "'apply' (coordinates from the record with the most data, the "
+                    "published elevation nearest the DEM).",
+     "column to fill": "", "write": ""},
+    {"tab": "Beyond_radius",
+     "what it shows": "Pairs more than 3 km apart that were never tested on their "
+                      "series.",
+     "what you do": "Optional. Fill in only if you know two of them are one station.",
+     "column to fill": "DECISION_merge (and optionally DECISION_note)",
+     "write": "yes = merge. no = keep separate. Blank = no decision. " + _ANSWERS},
+    {"tab": "Never_merge_rule",
+     "what it shows": "Pairs with no observation day in common. They can never be "
+                      "merged, whatever is written anywhere.",
+     "what you do": "Read only. There is no decision column, because no answer "
+                    "would change anything.",
+     "column to fill": "", "write": ""},
+    {"tab": "Decisions",
+     "what it shows": "The ledger of every merge decision ever made, including "
+                      "pairs no longer shown on another tab (still_offered = False).",
+     "what you do": "Do not edit. Change a decision on the tab where the pair is "
+                    "offered; the ledger follows.",
+     "column to fill": "", "write": ""},
+    {"tab": "Series_decisions",
+     "what it shows": "The ledger of every series exclusion decision ever made.",
+     "what you do": "Do not edit. Change a decision on the Series tab; the ledger "
+                    "follows.",
+     "column to fill": "", "write": ""},
+)
+
+
+def instructions_sheet() -> pd.DataFrame:
+    """The Start_here tab: every tab, what it shows, and what to write where."""
+    return pd.DataFrame(
+        list(_INSTRUCTIONS),
+        columns=["tab", "what it shows", "what you do", "column to fill", "write"],
+    )
+
+
 def write_workbook(path: Path, sheets: dict[str, pd.DataFrame]) -> Path:
     """
     Write the sheets to one .xlsx, with sensible column widths.

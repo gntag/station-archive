@@ -947,3 +947,40 @@ def test_flag_layer_keeps_one_row_per_station_variable():
     layer = build_flag_layer(report)
     assert len(layer) == 1
     assert layer.iloc[0]["breakpoint_date"] == pd.Timestamp("1996-01-01")
+
+
+# ---------------------------------------------------------------------------
+# flagged_breakpoint_table -- the Excel listing of where breaks are
+# ---------------------------------------------------------------------------
+
+def test_flagged_breakpoint_table_lists_surviving_breaks_with_station_identity():
+    from station_archive.homogeneity import flagged_breakpoint_table
+
+    report = pd.DataFrame([
+        {**_report_row("a", variable="pr"), "shift": 0.3, "shift_ratio": 1.35,
+         "min_support_at_break": 3},
+        {**_report_row("b", significant_fdr=False), "min_support_at_break": 2},
+        {**_report_row("c", variable="tasmax", breakpoint_date="1993-06-01"),
+         "min_support_at_break": 2},
+    ])
+    stations = pd.DataFrame({
+        "canonical_station_id": ["a", "b", "c"],
+        "name": ["ALPHA", "BETA", "GAMMA"],
+        "lat": [38.0, 39.0, 40.0],
+        "lon": [23.0, 24.0, 25.0],
+    })
+    table = flagged_breakpoint_table(report, stations)
+    assert list(table["canonical_station_id"]) == ["a", "c"]
+    assert list(table["name"]) == ["ALPHA", "GAMMA"]
+    for column in ("lat", "lon", "variable", "breakpoint_date", "transform",
+                   "shift", "shift_ratio", "statistic", "p_value", "min_support_at_break"):
+        assert column in table.columns
+
+
+def test_flagged_breakpoint_table_of_nothing_is_empty_with_columns():
+    from station_archive.homogeneity import flagged_breakpoint_table
+
+    table = flagged_breakpoint_table(pd.DataFrame(), pd.DataFrame(
+        columns=["canonical_station_id", "name", "lat", "lon"]))
+    assert table.empty
+    assert "breakpoint_date" in table.columns

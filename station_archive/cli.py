@@ -23,6 +23,15 @@ USAGE
   # Settle elevation disagreements between archives against a DEM.
   python -m station_archive.cli dem
 
+  # The quality-control pipeline, in two halves around one review sitting:
+  #   prepare -- crosswalk, climatology screen, review workbook (merges and
+  #              series exclusions in one place);
+  #   apply   -- the reviewer's decisions: crosswalk, elevations, selection
+  #              with exclusions, breakpoint flags, provenance.
+  python -m station_archive.cli prepare --reference cerra_stations.parquet \
+      --reference-static geo_stations.parquet
+  python -m station_archive.cli apply
+
   # Run the whole chain on synthetic data, with no network and no credentials.
   python -m station_archive.cli demo
 
@@ -54,6 +63,7 @@ import pandas as pd
 
 from station_archive import (
     bronze,
+    climatology as climatology_module,
     consolidate as consolidate_module,
     dem as dem_module,
     homogeneity as homogeneity_module,
@@ -70,6 +80,31 @@ from station_archive.types import Domain, StationInventory
 
 # Sources are declared once, in the registry. The CLI holds no second list.
 DEFAULT_SOURCES = registry.series_sources()
+
+# Layout of the CERRA-at-stations cache the downscaling project writes
+# (derived/step2_cache/cerra_stations_expanded.parquet): one row per point and
+# day, keyed by the canonical station id of the crosswalk it was built for.
+# Its values are already in canonical units -- checked on the cache itself:
+# degC, mm/day, percent and m/s -- so the screen converts nothing.
+CERRA_CACHE_COLUMNS = {
+    "tas": "cerra_tmean",
+    "tasmin": "cerra_tmin",
+    "tasmax": "cerra_tmax",
+    "pr": "cerra_precip",
+    "hurs": "cerra_rh",
+    "sfcWind": "cerra_wind",
+    "gust": "cerra_gust",
+}
+CERRA_CACHE_ID_COLUMN = "id"
+CERRA_CACHE_DATE_COLUMN = "date"
+# The reference orography, from the companion static table
+# (geo_stations_expanded.parquet), for the temperature lapse adjustment.
+CERRA_STATIC_ELEVATION_COLUMN = "cerra_elev_m"
+
+
+def review_workbook_path() -> Path:
+    """The one workbook every human decision in the pipeline lives in."""
+    return settings.review_dir() / "station_merge_review.xlsx"
 
 
 def build_source(name: str) -> StationSource:
@@ -389,8 +424,21 @@ def command_consolidate(args: argparse.Namespace) -> int:
     out = settings.consolidated_dir()
     out.mkdir(parents=True, exist_ok=True)
 
+    exclusions: dict = {}
+    if getattr(args, "decisions", None):
+        exclusions = climatology_module.exclusions_from_decisions(
+            climatology_module.load_exclusion_decisions(Path(args.decisions))
+        )
+        print(f"[consolidate] {len(exclusions)} series excluded by reviewer decision "
+              f"in {Path(args.decisions).name}")
+
     loader = bronze.SeriesLoader(period=policy.period)
     compatibility: list[dict] = []
+    # Reviewer exclusions are counted with the QC rejections: a value removed
+    # from the gold table by a decision is as much a rejection as one removed
+    # by a flag, and the audit must say so (plan 1.4, "transparent rejection
+    # reasons").
+    excluded_counts: dict[tuple[str, str, str], int] = {}
 
     values_writer = _BufferedParquetWriter(out / "observations_consolidated")
     # Non-selected candidates (plan 1.6 point 5): every value that existed
@@ -405,8 +453,18 @@ def command_consolidate(args: argparse.Namespace) -> int:
         group = aliases[aliases["canonical_station_id"] == canonical_id]
         for variable in policy.source_priority:
             result = consolidate_module.consolidate_station_variable(
-                canonical_id, group, variable, loader, policy=policy
+                canonical_id, group, variable, loader, policy=policy,
+                exclusions=exclusions,
             )
+            if exclusions and not result.non_selected.empty:
+                reviewed = result.non_selected[
+                    result.non_selected["rejection_reason"].str.startswith(
+                        "reviewer exclusion", na=False
+                    )
+                ]
+                for (src, var), n in reviewed.groupby(["source", "variable"]).size().items():
+                    key = (src, var, "reviewer exclusion (climatology screen)")
+                    excluded_counts[key] = excluded_counts.get(key, 0) + int(n)
             if not result.values.empty:
                 stations_written.add(canonical_id)
             values_writer.append(result.values)
@@ -427,7 +485,9 @@ def command_consolidate(args: argparse.Namespace) -> int:
     rejections = pd.DataFrame(
         [
             {"source": src, "variable": var, "reason": reason, "n_values": n}
-            for (src, var, reason), n in sorted(loader.rejections.items())
+            for (src, var, reason), n in sorted(
+                {**loader.rejections, **excluded_counts}.items()
+            )
         ]
     )
     rejections.to_csv(out / "qc_rejections.csv", index=False)
@@ -499,7 +559,8 @@ def command_homogeneity(args: argparse.Namespace) -> int:
         print(f"[homogeneity] no consolidated archive at {consolidated_dir}; run 'consolidate' first")
         return 1
 
-    stations_meta = pd.read_csv(stations_path)[["canonical_station_id", "lat", "lon"]]
+    stations_all = pd.read_csv(stations_path)
+    stations_meta = stations_all[["canonical_station_id", "lat", "lon"]]
     parts = sorted(parts_dir.glob("part-*.parquet"))
     # Four columns, not eleven. run_report reads only these, and the gold table
     # runs to ~9.7 million rows with string columns: measured on this archive,
@@ -533,6 +594,19 @@ def command_homogeneity(args: argparse.Namespace) -> int:
     # that joins onto the gold table (plan 1.4: "layer project flags").
     layer = homogeneity_module.build_flag_layer(report)
     layer.to_csv(out_path, index=False)
+
+    # The same flags for a person: where each break is and at which station.
+    # A listing, never an input -- nothing reads it back, and the flags stay
+    # diagnostic.
+    listing_path = review_module.write_workbook(
+        consolidated_dir / "homogeneity_breakpoints.xlsx",
+        {
+            "Breakpoints": homogeneity_module.flagged_breakpoint_table(
+                report, stations_all
+            ),
+            "All_series": report,
+        },
+    )
 
     print(f"[homogeneity] {len(report)} station/variable series reached")
     if not report.empty:
@@ -571,6 +645,7 @@ def command_homogeneity(args: argparse.Namespace) -> int:
     print("")
     print(f"[homogeneity] report     -> {report_path}")
     print(f"[homogeneity] flag layer -> {out_path} ({len(layer)} flags)")
+    print(f"[homogeneity] listing    -> {listing_path}")
     print("[homogeneity] diagnostic only -- no value in the archive was changed")
     return 0
 
@@ -605,7 +680,7 @@ def command_review(args: argparse.Namespace) -> int:
     # Decisions already recorded in the workbook being replaced. A rebuild is
     # routine -- the crosswalk changed, so the pairs did -- and it must not cost
     # the adjudication that went into the previous one.
-    workbook = settings.review_dir() / "station_merge_review.xlsx"
+    workbook = review_workbook_path()
     previous: dict = {}
     if workbook.exists():
         try:
@@ -633,6 +708,40 @@ def command_review(args: argparse.Namespace) -> int:
     ordered = review_module.carry_forward_decisions(ordered, previous)
     if "Decisions" in sheets and "Decisions" not in ordered:
         ordered["Decisions"] = sheets["Decisions"]
+
+    # The climatology screen's proposals, so merges and series exclusions are
+    # answered in one sitting. Placed after the merge sheets; the ledger last.
+    # Written even without a screen: the ledger is the only place an exclusion
+    # decision survives a rebuild, and dropping it would silently undo it.
+    screen_path = settings.consolidated_dir() / "climatology_screen.csv"
+    if screen_path.exists():
+        screen = pd.read_csv(screen_path, dtype={"source_station_id": str})
+    else:
+        screen = pd.DataFrame()
+        print(f"[review] no climatology screen at {screen_path}; "
+              f"run 'climatology' to fill the Series sheet")
+    previous_exclusions: dict = {}
+    if workbook.exists():
+        try:
+            previous_exclusions = climatology_module.load_exclusion_decisions(workbook)
+        except Exception as exc:
+            print(f"[review] could not read series decisions from {workbook.name}: {exc}")
+    series, ledger = review_module.carry_forward_exclusions(
+        review_module.series_sheet(screen), previous_exclusions
+    )
+    rebuilt: dict = {}
+    for name, frame in ordered.items():
+        rebuilt[name] = frame
+        if name == "Already_merged":
+            rebuilt[climatology_module.SERIES_SHEET] = series
+    rebuilt.setdefault(climatology_module.SERIES_SHEET, series)
+    rebuilt[climatology_module.SERIES_LEDGER_SHEET] = ledger
+    # The instructions come first, so the workbook opens on them.
+    ordered = {review_module.INSTRUCTIONS_SHEET: review_module.instructions_sheet(), **rebuilt}
+    counts = series["RECOMMENDATION"].value_counts()
+    print(f"[review] series sheet: {int(counts.get('EXCLUDE', 0))} proposed for "
+          f"exclusion, {int(counts.get('REVIEW', 0))} for review; "
+          f"{len(previous_exclusions)} series decision(s) carried forward")
     path = review_module.write_workbook(workbook, ordered)
     kept = sum(
         int((frame["DECISION_merge"].astype(str).str.strip() != "").sum())
@@ -681,15 +790,30 @@ def command_dem(args: argparse.Namespace) -> int:
     overrides = dem_module.build_elevation_overrides(
         aliases, canonical, policy, existing=existing, progress=True
     )
-    added = len(overrides) - n_existing
     out_path.parent.mkdir(parents=True, exist_ok=True)
     overrides.to_csv(out_path, index=False)
 
+    # Computed rows are recalculated on every run, so "rows added" says nothing
+    # about what moved. Report what changed against the file as it was.
+    before = (
+        {} if existing is None
+        else dict(zip(existing["canonical_station_id"], existing["elevation_m"]))
+    )
+    changed = overrides[[
+        before.get(cid) != elev
+        for cid, elev in zip(overrides["canonical_station_id"], overrides["elevation_m"])
+    ]]
+    removed = sorted(set(before) - set(overrides["canonical_station_id"]))
+    by_hand = int((~overrides["reason"].map(dem_module.is_computed_override)).sum())
+
     print("")
-    print(f"[dem] {added} station(s) newly settled, {len(overrides)} override(s) in total")
-    if added:
-        fresh = overrides.tail(added)
-        for _, row in fresh.iterrows():
+    print(f"[dem] {len(overrides)} override(s): {by_hand} by hand (kept as written), "
+          f"{len(overrides) - by_hand} computed; {len(changed)} new or changed, "
+          f"{len(removed)} no longer needed")
+    for cid in removed:
+        print(f"    {cid:26s} removed: its aliases no longer disagree")
+    if len(changed):
+        for _, row in changed.iterrows():
             gap = row["reason"].split("gap ")[-1].split(" m)")[0] if "gap " in row["reason"] else "?"
             print(f"    {row['canonical_station_id']:26s} -> {row['elevation_m']:8.1f} m "
                   f"(DEM within {gap} m)")
@@ -698,6 +822,176 @@ def command_dem(args: argparse.Namespace) -> int:
         print("[dem] nearest one won on relative proximity alone -- read the reason.")
     print(f"[dem] wrote -> {out_path}")
     print("[dem] applied at read time; the consolidated archive is untouched")
+    return 0
+
+
+def command_climatology(args: argparse.Namespace) -> int:
+    """
+    Screen every selectable source record against an independent reference
+    (plan 1.4). Writes a diagnostic table only: it proposes exclusions for the
+    review workbook and changes no value. Consolidation acts on a reviewer's
+    'yes', and on nothing else.
+    """
+    policy = policy_from_args(args)
+    alias_path = settings.canonical_dir() / "station_aliases.csv"
+    if not alias_path.exists():
+        print(f"[climatology] no crosswalk at {alias_path}; run 'identity' first")
+        return 1
+    reference_path = Path(args.reference)
+    if not reference_path.exists():
+        print(f"[climatology] no reference table at {reference_path}")
+        return 1
+
+    aliases = pd.read_csv(alias_path, dtype={"source_station_id": str})
+    columns = {
+        v: c for v, c in CERRA_CACHE_COLUMNS.items() if v in policy.source_priority
+    }
+    print(f"[climatology] reading reference {reference_path.name} …")
+    wide = pd.read_parquet(
+        reference_path,
+        columns=[CERRA_CACHE_ID_COLUMN, CERRA_CACHE_DATE_COLUMN, *columns.values()],
+    )
+    elevation: dict = {}
+    if getattr(args, "reference_static", None):
+        static = pd.read_parquet(
+            args.reference_static,
+            columns=[CERRA_CACHE_ID_COLUMN, CERRA_STATIC_ELEVATION_COLUMN],
+        )
+        elevation = dict(
+            zip(static[CERRA_CACHE_ID_COLUMN], static[CERRA_STATIC_ELEVATION_COLUMN])
+        )
+    else:
+        print("[climatology] no --reference-static: temperatures compared "
+              "without the elevation adjustment")
+    reference = climatology_module.reference_from_wide(
+        wide, CERRA_CACHE_ID_COLUMN, CERRA_CACHE_DATE_COLUMN, columns, elevation
+    )
+    del wide
+
+    loader = bronze.SeriesLoader(period=policy.period)
+    screen = climatology_module.run_screen(
+        aliases, loader, reference, policy=policy, progress=True
+    )
+    out = settings.consolidated_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "climatology_screen.csv"
+    screen.to_csv(path, index=False)
+    # Provenance: which reference this screen ran on, and the screen itself,
+    # by checksum. 'provenance' carries it into manifests/provenance.json.
+    manifests.record_reference({
+        "reference": reference_path,
+        "reference_static": (
+            Path(args.reference_static) if getattr(args, "reference_static", None) else None
+        ),
+        "screen": path,
+    })
+
+    print("")
+    print(f"[climatology] {len(screen)} record x variable series reached")
+    if not screen.empty:
+        print("[climatology] outcome by status:")
+        for status, n in screen["status"].value_counts().items():
+            print(f"    {status}: {n}")
+        tested = screen[screen["status"] == "tested"]
+        table = pd.crosstab(tested["variable"], tested["tier"])
+        print("")
+        print("[climatology] tested series by tier:")
+        print(table.to_string())
+        proposed = tested[tested["tier"] == climatology_module.TIER_EXCLUDE]
+        if not proposed.empty:
+            print("")
+            print("[climatology] proposed for exclusion:")
+            for _, row in proposed.sort_values(["variable", "robust_z"]).iterrows():
+                print(f"    {row['variable']:8s} {row['alias']:24s} {str(row['name'])[:26]:26s} "
+                      f"station {row['station_mean']:8.2f}  reference {row['reference_mean']:8.2f}  "
+                      f"z {row['robust_z']:+7.1f}  neighbours {int(row['n_neighbors'])} "
+                      f"({int(row['n_neighbors_same_direction'])} same way)")
+    print("")
+    print(f"[climatology] wrote -> {path}")
+    print(f"[climatology] reference recorded -> {manifests.reference_record_path()}")
+    print("[climatology] diagnostic only -- 'review' puts these in the workbook; "
+          "nothing is excluded without a reviewer's 'yes'")
+    return 0
+
+
+def _with(args: argparse.Namespace, **values) -> argparse.Namespace:
+    """A copy of the parsed arguments with some set, for chaining commands."""
+    return argparse.Namespace(**{**vars(args), **values})
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    """
+    Everything a reviewer needs, in one workbook (the first half of the QC
+    pipeline): the crosswalk with any decisions already made, the climatology
+    screen, then the workbook holding both kinds of question.
+
+    Merges and series exclusions can be answered at one sitting because neither
+    depends on the other: the screen judges source records, not merged
+    stations, and an exclusion never changes the evidence a merge rests on.
+    """
+    workbook = review_workbook_path()
+    decisions = str(workbook) if workbook.exists() else None
+    steps = (
+        ("identity", command_identity, _with(
+            args, sources=list(registry.crosswalk_sources()), decisions=decisions)),
+        ("climatology", command_climatology, args),
+        ("review", command_review, args),
+    )
+    for name, handler, step_args in steps:
+        print(f"\n========== prepare: {name} ==========")
+        code = handler(step_args)
+        if code:
+            print(f"[prepare] stopped: '{name}' failed")
+            return code
+    print("")
+    print(f"[prepare] answer the workbook, then run 'apply': {workbook}")
+    return 0
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    """
+    Apply every decision in the review workbook (the second half of the QC
+    pipeline): the crosswalk with merge decisions, elevations against the DEM
+    for the groups that now exist, selection with series exclusions, breakpoint
+    flags on the result, and the provenance record of what built it.
+
+    Elevation needs no question: the rule keeps the coordinates of the record
+    with the most observations and the published elevation nearest the DEM,
+    and it runs after the merges because a merge changes the candidates.
+    Breakpoints come last because they can only be found on final series.
+    """
+    workbook = review_workbook_path()
+    if not workbook.exists():
+        print(f"[apply] no review workbook at {workbook}; run 'prepare' first")
+        return 1
+    steps = (
+        ("identity", command_identity, _with(
+            args, sources=list(registry.crosswalk_sources()), decisions=str(workbook))),
+        ("dem", command_dem, args),
+        ("consolidate", command_consolidate, _with(args, decisions=str(workbook))),
+        ("homogeneity", command_homogeneity, args),
+        ("provenance", command_provenance, _with(args, policy_out=None)),
+    )
+    for name, handler, step_args in steps:
+        print(f"\n========== apply: {name} ==========")
+        code = handler(step_args)
+        if code:
+            print(f"[apply] stopped: '{name}' failed")
+            return code
+
+    # A blank answer keeps the series. Say how many proposals were left that
+    # way, so "nothing was excluded" is never mistaken for "nothing was wrong".
+    try:
+        series = pd.read_excel(workbook, sheet_name=climatology_module.SERIES_SHEET, dtype=str)
+    except ValueError:
+        series = pd.DataFrame()
+    if not series.empty and "RECOMMENDATION" in series.columns:
+        answered = series["DECISION_exclude"].fillna("").str.strip().str.lower()
+        open_ = series[(series["RECOMMENDATION"] == "EXCLUDE") & ~answered.isin(["yes", "no"])]
+        if len(open_):
+            print("")
+            print(f"[apply] {len(open_)} series proposed for exclusion have no decision "
+                  f"and were kept; answer them in the Series sheet and run 'apply' again")
     return 0
 
 
@@ -732,6 +1026,13 @@ def command_provenance(args: argparse.Namespace) -> int:
         print(f"  {source:10s} release {detail['release']:24s} "
               f"{detail['n_snapshots']:5d} snapshots  "
               f"{detail['archive_checksum'][:16]}...")
+    reference = record["climatology_reference"]
+    if "reference" in reference:
+        print(f"  {'reference':10s} {reference['reference'].get('file', '')} "
+              f"sha256 {reference['reference'].get('sha256', '')[:16]}... "
+              f"(climatology screen, recorded {reference.get('recorded_at', '?')})")
+    else:
+        print(f"  {'reference':10s} {reference.get('status', 'not used')}")
     print("")
     if args.policy_out:
         out = Path(args.policy_out)
@@ -880,6 +1181,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Select canonical values per station/date/variable (plan 1.6).",
     )
     cons.add_argument("--limit", type=int, default=0, help="First N canonical stations only.")
+    cons.add_argument(
+        "--decisions",
+        default=None,
+        help="Review workbook whose Series sheet carries DECISION_exclude values.",
+    )
     cons.set_defaults(handler=command_consolidate)
 
     # No --variables of its own: the shared policy argument means the same thing
@@ -918,6 +1224,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Settle elevation disagreements between archives against a DEM.",
     )
     dem_cmd.set_defaults(handler=command_dem)
+
+    def reference_arguments(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument(
+            "--reference", required=True, metavar="PARQUET",
+            help="Reference daily values at each station (the CERRA-at-stations cache).",
+        )
+        sub.add_argument(
+            "--reference-static", default=None, metavar="PARQUET",
+            help="Reference orography per station, for the temperature lapse adjustment.",
+        )
+
+    clim = subparsers.add_parser(
+        "climatology", parents=shared,
+        help="Screen source records against an independent reference (plan 1.4).",
+    )
+    reference_arguments(clim)
+    clim.set_defaults(handler=command_climatology)
+
+    prep = subparsers.add_parser(
+        "prepare", parents=shared,
+        help="QC pipeline, part 1: crosswalk, climatology screen, review workbook.",
+    )
+    reference_arguments(prep)
+    prep.add_argument("--max-distance-km", type=float, default=3.0)
+    prep.set_defaults(handler=command_prepare)
+
+    apply_cmd = subparsers.add_parser(
+        "apply", parents=shared,
+        help="QC pipeline, part 2: apply the workbook and rebuild the archive.",
+    )
+    apply_cmd.add_argument("--limit", type=int, default=0, help="First N canonical stations only.")
+    apply_cmd.add_argument("--permutations", type=int, default=500)
+    apply_cmd.add_argument("--alpha", type=float, default=0.05)
+    apply_cmd.set_defaults(handler=command_apply)
 
     demo = subparsers.add_parser(
         "demo", parents=shared,

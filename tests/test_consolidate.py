@@ -790,3 +790,78 @@ def test_selected_fallback_values_do_not_also_appear_as_non_selected():
     selected_ghcnd_dates = set(out.values.loc[out.values["is_fallback"], "date"])
     non_selected_ghcnd_dates = set(out.non_selected["date"])
     assert selected_ghcnd_dates.isdisjoint(non_selected_ghcnd_dates)
+
+
+# ---------------------------------------------------------------------------
+# Reviewer exclusions (the climatology screen's decisions, applied here)
+# ---------------------------------------------------------------------------
+
+def test_an_excluded_record_hands_its_days_to_the_next_source():
+    """
+    Monte Cimone's ECA&D precipitation is 0.19 mm/day where GHCN-D and CERRA
+    give several mm. Excluding it must let GHCN-D supply the station, not leave
+    the series empty.
+    """
+    loader = FakeLoader({
+        ("ecad", "E", "pr"): _daily([1.0] * 400),          # 0.1 mm units
+        ("ghcnd", "G", "pr"): _daily([80.0] * 400),        # 0.1 mm units
+    })
+    result = consolidate_station_variable(
+        "c:1", _aliases(("ecad", "E"), ("ghcnd", "G")), "pr", loader,
+        exclusions={("ecad:E", "pr"): "ECA&D amounts 40x too small"},
+    )
+    values = result.values
+    assert (values["selected_source"] == "ghcnd").all()
+    assert len(values) == 400
+    assert not values["is_fallback"].any()
+    excluded = result.non_selected[result.non_selected["source"] == "ecad"]
+    assert len(excluded) == 400
+    assert excluded["rejection_reason"].str.startswith("reviewer exclusion: ").all()
+    assert "40x too small" in excluded["rejection_reason"].iloc[0]
+
+
+def test_an_exclusion_names_one_variable_only():
+    loader = FakeLoader({
+        ("ecad", "E", "pr"): _daily([10.0] * 400),
+        ("ecad", "E", "tasmax"): _daily([200.0] * 400),
+    })
+    exclusions = {("ecad:E", "pr"): "bad"}
+    tasmax = consolidate_station_variable(
+        "c:1", _aliases(("ecad", "E")), "tasmax", loader, exclusions=exclusions
+    )
+    assert len(tasmax.values) == 400
+
+
+def test_excluding_the_only_record_leaves_the_series_missing_but_audited():
+    loader = FakeLoader({("ecad", "E", "pr"): _daily([0.0] * 400)})
+    result = consolidate_station_variable(
+        "c:1", _aliases(("ecad", "E")), "pr", loader,
+        exclusions={("ecad:E", "pr"): "always zero"},
+    )
+    assert result.values.empty
+    assert len(result.non_selected) == 400
+
+
+def test_no_exclusions_changes_nothing():
+    loader = FakeLoader({
+        ("ecad", "E", "pr"): _daily([10.0] * 400),
+        ("ghcnd", "G", "pr"): _daily([12.0] * 400),
+    })
+    aliases = _aliases(("ecad", "E"), ("ghcnd", "G"))
+    a = consolidate_station_variable("c:1", aliases, "pr", loader)
+    b = consolidate_station_variable("c:1", aliases, "pr", loader, exclusions={})
+    pd.testing.assert_frame_equal(a.values, b.values)
+
+
+def test_a_promoted_record_says_why_it_is_primary():
+    """'Highest-ranked source with data' would be false: rank 1 had data and was excluded."""
+    loader = FakeLoader({
+        ("ecad", "E", "pr"): _daily([1.0] * 400),
+        ("ghcnd", "G", "pr"): _daily([80.0] * 400),
+    })
+    result = consolidate_station_variable(
+        "c:1", _aliases(("ecad", "E"), ("ghcnd", "G")), "pr", loader,
+        exclusions={("ecad:E", "pr"): "amounts too small"},
+    )
+    reason = result.values["selection_reason"].iloc[0]
+    assert "ecad:E" in reason and "excluded by reviewer" in reason

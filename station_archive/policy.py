@@ -323,6 +323,64 @@ class DemPolicy:
     zoom: int = 15
 
 
+@dataclass(frozen=True)
+class ClimatologyPolicy:
+    """
+    When a record's long-term mean is too far from an independent reference
+    to be believed (plan 1.4: QC layered over provider flags, with transparent
+    rejection reasons).
+
+    The screen measures each source record's departure from a reference
+    sampled at the same place on the same days, then scores it against the
+    spread of every other record of that variable. It proposes; a reviewer
+    decides; only consolidation acts, and only on an explicit 'yes'.
+
+    Measured on this archive against CERRA before the rule was set (n >= 365
+    matched days): the fixed "half or double" rule flagged no gust record,
+    18 sfcWind and 31 pr; the robust-z rule at 4 flagged gust 0, sfcWind 5,
+    pr 29, tas 4, tasmax 3, tasmin 1, hurs 0. The pr flags are dominated by
+    ECA&D series reporting exactly zero on 400-6,600 matched days, and the tasmax
+    flags by a Lazio block reading +5 to +6 degC above the reference.
+    """
+
+    # Matched station/reference days before a departure is computed. A year,
+    # so a seasonal record cannot pass for a climatology.
+    min_matched_days: int = 365
+
+    # Robust z = (departure - median) / (1.4826 * MAD), per variable over every
+    # tested record. Above exclude_z the record is proposed for exclusion;
+    # above review_z it is shown for review only. Agreed with the archive's
+    # owner, not fitted: tuning these until a particular network is caught
+    # would build that network's comparison artefact into the rule.
+    review_z: float = 3.0
+    exclude_z: float = 4.0
+
+    # Compared as a log ratio: their spread grows with their level, so a
+    # difference would make a wet or windy site look anomalous by being wet or
+    # windy. A record whose mean is zero against a positive reference departs
+    # by -inf, which is the strongest flag there is.
+    multiplicative_variables: frozenset[str] = frozenset({"pr", "sfcWind", "gust"})
+
+    # Temperature is compared in degC after moving the reference to the
+    # station's height at the standard-atmosphere lapse rate. A diagnostic
+    # adjustment only: no value is ever changed by it. Without it every
+    # mountain station would sit several degrees from a reference whose
+    # orography is a 5.5 km average.
+    lapse_rate_k_per_m: float = 0.0065
+    lapse_variables: frozenset[str] = frozenset({"tas", "tasmin", "tasmax"})
+
+    # Neighbour context for the reviewer, never a gate: the same radius the
+    # homogeneity neighbour search uses.
+    neighbor_radius_km: float = 100.0
+
+    def __post_init__(self) -> None:
+        if not self.review_z < self.exclude_z:
+            raise ValueError(
+                f"review_z ({self.review_z}) must be below exclude_z "
+                f"({self.exclude_z}): the review tier sits between them"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Source selection (plan section 1.6)
 # ---------------------------------------------------------------------------
@@ -391,6 +449,7 @@ class Policy:
     fallback: FallbackPolicy = field(default_factory=FallbackPolicy)
     homogeneity: HomogeneityPolicy = field(default_factory=HomogeneityPolicy)
     dem: DemPolicy = field(default_factory=DemPolicy)
+    climatology: ClimatologyPolicy = field(default_factory=ClimatologyPolicy)
 
     def __post_init__(self) -> None:
         # Fail at construction rather than three stages later. The old
@@ -497,6 +556,7 @@ class Policy:
             ("fallback", FallbackPolicy),
             ("homogeneity", HomogeneityPolicy),
             ("dem", DemPolicy),
+            ("climatology", ClimatologyPolicy),
         ):
             if name in data:
                 kwargs[name] = _sub_policy(klass, data[name])

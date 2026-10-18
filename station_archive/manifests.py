@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 from station_archive import settings
 from station_archive.types import DownloadRequest, SourceRelease, SourceSnapshot
@@ -188,6 +188,11 @@ def build_provenance(policy: Any, sources: Iterable[str]) -> dict[str, Any]:
         },
         "policy": policy.to_dict(),
         "sources": per_source,
+        # The climatology screen's reference is an input the archive depends
+        # on -- it decides which series are proposed for exclusion -- without
+        # being a source. Two archives built from the same snapshots but
+        # screened against different references must not share a record.
+        "climatology_reference": read_reference_record() or {"status": "not used"},
     }
 
 
@@ -199,6 +204,59 @@ def _utc_now() -> str:
 
 def provenance_path() -> Path:
     return settings.archive_root() / "manifests" / "provenance.json"
+
+
+def reference_record_path() -> Path:
+    return settings.archive_root() / "manifests" / "climatology_reference.json"
+
+
+def _file_record(path: Optional[Path]) -> dict[str, Any]:
+    """
+    A file identified by name, size and sha256 -- never by its full path.
+
+    The path is where the file sits on one machine; the checksum is what the
+    file is, and the only part of the record another reader can check.
+    """
+    import hashlib
+
+    if path is None:
+        return {"status": "not given"}
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return {
+        "file": Path(path).name,
+        "bytes": Path(path).stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def record_reference(files: Mapping[str, Optional[Path]]) -> dict[str, Any]:
+    """
+    Record which reference files the climatology screen ran on, and the
+    screen it produced, for build_provenance to carry.
+
+    Written by the screen itself, at the moment it reads the files, so the
+    record describes what was realised rather than what a later command was
+    told. Replaced on every screen run: provenance describes the screen behind
+    the current proposals, not every screen ever run.
+    """
+    record: dict[str, Any] = {
+        "recorded_at": _utc_now(),
+        **{role: _file_record(path) for role, path in files.items()},
+    }
+    path = reference_record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_reference_record() -> Optional[dict[str, Any]]:
+    path = reference_record_path()
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def archive_checksum(source: str, release: str) -> str:

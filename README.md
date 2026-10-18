@@ -144,11 +144,12 @@ day and variable:
   provider issued them.
 
 **Measured on the real archive** (eastern Mediterranean, 1985–2005): 1,944
-source station records became 1,546 canonical stations and 9,688,780 accepted
-daily values, with 240,704 values rejected as non-observations, 152 source
-switches refused as incompatible, 3,223,583 non-selected candidate values
-retained for audit, and 482 series flagged as containing a suspected artificial
-breakpoint.
+source station records became 1,546 canonical stations and 9,503,860 accepted
+daily values, with 240,704 values rejected as non-observations, 246,989 values
+excluded by a reviewer after the climatology screen (78 record x variable
+series), 146 source switches refused as incompatible, 3,408,503 non-selected
+candidate values retained for audit, and 478 series flagged as containing a
+suspected artificial breakpoint.
 
 This file is what you need to install the package, run it, and understand what
 comes out. **`AGENTS.md` is the detailed companion**: every threshold with the
@@ -336,6 +337,27 @@ station-archive homogeneity                   # breakpoint diagnosis
 station-archive provenance                    # what built this archive
 ```
 
+Once the archive exists, the quality-control loop is two commands around one
+sitting with the review workbook:
+
+```bash
+station-archive prepare --reference derived/step2_cache/cerra_stations_expanded.parquet \
+    --reference-static derived/step2_cache/geo_stations_expanded.parquet
+#   identity (with decisions already made) -> climatology screen -> review workbook
+#   ... answer DECISION_merge and DECISION_exclude in review/station_merge_review.xlsx ...
+station-archive apply
+#   identity --decisions -> dem -> consolidate --decisions -> homogeneity -> provenance
+```
+
+Merges and series exclusions are answered at the same sitting because neither
+depends on the other: the climatology screen judges each source record, not
+the merged station, and an exclusion never changes the evidence a merge rests
+on. Elevation asks nothing — the rule keeps the coordinates of the record with
+the most observations and the published elevation nearest the DEM — and runs
+after the merges, because a merge changes the candidates. Breakpoints come last
+because they can only be found on the final series; they are flags, listed in
+`consolidated/homogeneity_breakpoints.xlsx`, and change no value.
+
 Discovery comes before acquisition on purpose: there is no path that
 bulk-downloads without writing a coverage record first.
 
@@ -346,10 +368,15 @@ diagnosis.
 
 Two stages stop and ask a person. `review` builds a spreadsheet of the station
 pairs the rules could not resolve; you fill in `DECISION_merge` with `yes` or
-`no` and feed it back with `identity --decisions`. `dem` settles elevation
+`no` and feed it back with `identity --decisions`. The same workbook's `Series`
+sheet lists the source records whose long-term mean sits implausibly far from
+an independent reference (`climatology`); a `yes` in `DECISION_exclude` takes
+that record out of selection in `consolidate --decisions`, and the next-ranked
+source takes over. A blank keeps the record. `dem` settles elevation
 disagreements against an independent digital elevation model and writes
-`review/elevation_overrides.csv`. Both are inputs the pipeline reads and never
-writes over, and a rebuild carries forward every decision already made.
+`review/elevation_overrides.csv`. Both are inputs: the pipeline rebuilds them,
+but a rebuild carries forward every decision already made and every override
+written by hand.
 
 ### Running it on your own region
 
@@ -445,6 +472,8 @@ Four conventions worth knowing before you read it:
 | `consolidated/source_contribution.csv` | Selected days by variable, year, source and fallback status |
 | `consolidated/homogeneity_breakpoints.csv` | The full breakpoint report, including series that could not be tested and why |
 | `consolidated/homogeneity_flags.csv` | The flag layer: FDR-surviving rows only, shaped to join onto the gold table |
+| `consolidated/homogeneity_breakpoints.xlsx` | The same flags for a person: every surviving break with station name, position, date and shift |
+| `consolidated/climatology_screen.csv` | Every selectable source record x variable against the reference: departure, robust z, tier, reporting fraction, neighbour context |
 | `canonical/station_aliases.csv` | Every source station, its canonical ID, the tier and evidence that put it there, and its risk flags |
 | `canonical/canonical_stations.csv` | One authoritative coordinate, elevation and name per canonical station, with the contest that decided it |
 | `canonical/station_metadata_history.csv` | Each alias's own coordinates as a time-bounded segment — a moved station is two segments, never an average |
@@ -452,7 +481,7 @@ Four conventions worth knowing before you read it:
 | `canonical/metadata_conflicts.csv` | Pairs whose observations prove one instrument but whose archives publish irreconcilable coordinates or elevation |
 | `inventory/coverage_report.md` | What each source offers in the domain, before anything is downloaded |
 | `manifests/provenance.json` | What built this archive: the policy in force, each provider release and checksum, library versions |
-| `review/station_merge_review.xlsx` | **Input.** Merge decisions for pairs the rules could not resolve |
+| `review/station_merge_review.xlsx` | **Input.** Merge decisions for pairs the rules could not resolve, and series exclusions (`Series` sheet) |
 | `review/elevation_overrides.csv` | **Input.** Reviewed elevation corrections, applied at read time with the evidence for each |
 
 **Every column of every one of these is documented field by field in `AGENTS.md`
@@ -484,7 +513,7 @@ last for precipitation despite having the most stations.
 python -m pytest tests/ -q
 ```
 
-387 tests, a few seconds, no network. The suite is part of the repository on
+440 tests, a few seconds, no network. The suite is part of the repository on
 purpose: for a published pipeline it is the executable statement of the archive's
 rules, not developer scaffolding. `test_standardize.py` is what keeps the
 withdrawn bias correction withdrawn; `test_consolidate.py` is the only artefact

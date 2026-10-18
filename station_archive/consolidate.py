@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -279,7 +279,7 @@ class StationConsolidation:
     non_selected: pd.DataFrame = field(default_factory=lambda: _empty_non_selected())
 
 
-def _canonical_series(
+def canonical_series(
     source: str,
     station_id: str,
     variable: str,
@@ -290,7 +290,8 @@ def _canonical_series(
 
     Conversion happens here rather than in the loader because bronze is
     defined as provider values in provider units (section 1.4); the silver
-    layer is where they become comparable.
+    layer is where they become comparable. Public because the climatology
+    screen judges exactly the series this module would select from.
     """
     from station_archive.identity import provider_units
 
@@ -325,6 +326,7 @@ def consolidate_station_variable(
     series_loader,
     priority: Optional[Sequence[str]] = None,
     policy: Policy = DEFAULT_POLICY,
+    exclusions: Optional[Mapping[tuple[str, str], str]] = None,
 ) -> StationConsolidation:
     """
     Select one value per day for one canonical station and variable.
@@ -337,28 +339,61 @@ def consolidate_station_variable(
     Sources absent from the configured priority never contribute, which is
     how c3s_land stays an audit cross-check rather than becoming a silent
     fallback for the GHCN-D records it duplicates.
+
+    `exclusions` maps (alias key, variable) to a reviewer's reason for
+    excluding that record (climatology.exclusions_from_decisions). An excluded
+    record is not a candidate at all: its values go to the audit table under
+    that reason, and the next-ranked record becomes the primary. That is the
+    point of excluding inside consolidation rather than at read time -- an ECA&D
+    series reading 40x too little rain hands the station to GHCN-D instead of
+    leaving it empty.
     """
     ranking = list(
         priority if priority is not None else policy.priority_for(variable)
     )
     units = standardize.canonical_unit_for(variable) or ""
 
+    excluded = exclusions or {}
+    excluded_here: list[str] = []
+    non_selected_frames: list[pd.DataFrame] = []
     available: list[tuple[int, str, str, pd.Series]] = []
     for rank, source in enumerate(ranking, start=1):
         for row in aliases[aliases["source"] == source].itertuples(index=False):
-            series = _canonical_series(
-                source, str(row.source_station_id), variable, series_loader
-            )
-            if not series.empty:
-                available.append((rank, source, str(row.source_station_id), series))
+            station_id = str(row.source_station_id)
+            series = canonical_series(source, station_id, variable, series_loader)
+            if series.empty:
+                continue
+            reason = excluded.get((f"{source}:{station_id}", variable))
+            if reason is not None:
+                non_selected_frames.append(
+                    _non_selected_frame(
+                        canonical_station_id, variable, source, station_id,
+                        series, units, rank, f"reviewer exclusion: {reason}",
+                    )
+                )
+                excluded_here.append(f"{source}:{station_id}")
+                continue
+            available.append((rank, source, station_id, series))
 
     if not available:
-        return StationConsolidation(values=_empty_consolidation())
-
-    non_selected_frames: list[pd.DataFrame] = []
+        return StationConsolidation(
+            values=_empty_consolidation(),
+            non_selected=(
+                pd.concat(non_selected_frames, ignore_index=True)
+                if non_selected_frames else _empty_non_selected()
+            ),
+        )
 
     available.sort(key=lambda item: (item[0], item[1], item[2]))
     primary_rank, primary_source, primary_id, primary_series = available[0]
+    primary_reason = f"highest-ranked source with data (rank {primary_rank})"
+    if excluded_here:
+        # Without this the reason would be false: a higher-ranked record had
+        # data, and is missing only because a reviewer excluded it.
+        primary_reason = (
+            f"highest-ranked record not excluded (rank {primary_rank}); "
+            f"excluded by reviewer: {', '.join(excluded_here)}"
+        )
 
     frame = pd.DataFrame(
         {
@@ -370,7 +405,7 @@ def consolidate_station_variable(
             "selected_source": primary_source,
             "source_station_id": primary_id,
             "source_rank": primary_rank,
-            "selection_reason": f"highest-ranked source with data (rank {primary_rank})",
+            "selection_reason": primary_reason,
             "is_fallback": False,
             "source_record_id": [
                 f"{primary_source}:{primary_id}:{d.date().isoformat()}:{variable}"
